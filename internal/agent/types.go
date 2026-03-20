@@ -71,8 +71,9 @@ type Task struct {
 	ID           string            `json:"id"`
 	Title        string            `json:"title"`
 	Description  string            `json:"description"`
-	AgentRole    string            `json:"agent_role"`  // which role should handle this
-	AssignedTo   string            `json:"assigned_to"` // agent ID after assignment
+	AgentRole    string            `json:"agent_role"`   // which role should handle this
+	AssignedTo   string            `json:"assigned_to"`  // agent ID after assignment
+	Complexity   string            `json:"complexity"`   // S | M | L — controls context loading tier
 	Status       TaskStatus        `json:"status"`
 	Priority     Priority          `json:"priority"`
 	DependsOn    []string          `json:"depends_on"` // task IDs that must complete first
@@ -99,6 +100,7 @@ type taskJSON struct {
 	Description  string            `json:"description"`
 	AgentRole    string            `json:"agent_role"`
 	AssignedTo   string            `json:"assigned_to"`
+	Complexity   string            `json:"complexity"`
 	Status       TaskStatus        `json:"status"`
 	Priority     Priority          `json:"priority"`
 	DependsOn    []string          `json:"depends_on"`
@@ -122,6 +124,7 @@ func (t *Task) MarshalJSON() ([]byte, error) {
 		Description:  t.Description,
 		AgentRole:    t.AgentRole,
 		AssignedTo:   t.AssignedTo,
+		Complexity:   t.Complexity,
 		Status:       t.Status,
 		Priority:     t.Priority,
 		DependsOn:    t.DependsOn,
@@ -172,11 +175,15 @@ type Artifact struct {
 // MemoryContext is injected into each agent before running a task.
 // Agents read this context so they never "forget" project state.
 type MemoryContext struct {
-	ProjectDoc   string               // content of project.md
-	RecentTasks  []*Task              // last 5 completed tasks for the same role
-	RelevantCode []string             // RAG results from task history
-	ADRs         []string             // Architecture Decision Records
-	Resolved     *state.ResolvedStore // optional error pattern store for layer 4
+	ProjectDoc   string                // content of project.md (length varies by tier)
+	RecentTasks  []*Task               // recent completed tasks for the same role
+	RelevantCode []string              // RAG results: recent task summaries + resolved error patterns
+	ADRs         []string              // Architecture Decision Records (tier 3 only)
+	Resolved     *state.ResolvedStore  // optional error pattern store for runtime lookups
+	Scope        *state.ScopeManifest  // this agent's scope manifest
+	AllScopes    []*state.ScopeManifest // all agent scopes for cross-agent awareness (tier 3 only)
+	AgentDoc     string                // role-specific memory from memory/agents/<role>.md
+	Scratchpad   *state.Scratchpad     // shared team scratchpad; may be nil
 }
 
 // ─── Events ──────────────────────────────────────────────────────────────────

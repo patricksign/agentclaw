@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,11 +12,16 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
+	"github.com/robfig/cron/v3"
+
 	"github.com/patricksign/agentclaw/internal/agent"
 	"github.com/patricksign/agentclaw/internal/api"
+	"github.com/patricksign/agentclaw/internal/integrations/trello"
+	"github.com/patricksign/agentclaw/internal/llm"
 	"github.com/patricksign/agentclaw/internal/memory"
 	"github.com/patricksign/agentclaw/internal/queue"
-	"github.com/patricksign/agentclaw/internal/integrations/trello"
+	"github.com/patricksign/agentclaw/internal/state"
+	"github.com/patricksign/agentclaw/internal/summarizer"
 )
 
 // maxTaskRetries is the fixed maximum number of retry attempts for a failed task.
@@ -28,15 +34,23 @@ func main() {
 
 	dbPath := getenv("DB_PATH", "./agentclaw.db")
 	projectPath := getenv("PROJECT_PATH", "./memory/project.md")
+	scopePath := getenv("SCOPE_PATH", "./state")
 	addr := getenv("ADDR", ":8080")
 
 	// ─── Wire dependencies ───────────────────────────────────────────────────
 
 	bus := agent.NewEventBus()
 
-	mem, err := memory.New(dbPath, projectPath)
+	mem, err := memory.NewWithState(dbPath, projectPath, scopePath)
 	if err != nil {
 		log.Fatal().Err(err).Msg("failed to init memory store")
+	}
+
+	// Seed default scope manifests for all 10 agents (no-op if already present).
+	if ss := mem.Scope(); ss != nil {
+		if err := initDefaultScopes(ss); err != nil {
+			log.Warn().Err(err).Msg("failed to seed default scope manifests")
+		}
 	}
 	log.Info().Str("db", dbPath).Msg("memory store ready")
 	defer func() {
@@ -98,6 +112,40 @@ func main() {
 	telegramToken := getenv("TELEGRAM_BOT_TOKEN", "")
 	telegramChatID := getenv("TELEGRAM_CHAT_ID", "")
 	srv := api.NewServer(pool, q, mem, bus, triggerTrelloClient, telegramToken, telegramChatID)
+
+	// ─── Summarizer + weekly cron ────────────────────────────────────────────
+	anthropicKey := getenv("ANTHROPIC_API_KEY", "")
+	llmRouter := llm.NewRouterWithEnv(map[string]string{"ANTHROPIC_API_KEY": anthropicKey})
+	sum := summarizer.New(mem, mem.AgentDoc(), llmRouter, scopePath)
+	srv.SetSummarizer(sum)
+
+	// Compress agent history every Sunday at 02:00.
+	cronScheduler := cron.New()
+	summarizerConfigs := []agent.Config{
+		{ID: "idea", Role: "idea"},
+		{ID: "architect", Role: "architect"},
+		{ID: "breakdown", Role: "breakdown"},
+		{ID: "coding", Role: "coding"},
+		{ID: "test", Role: "test"},
+		{ID: "review", Role: "review"},
+		{ID: "docs", Role: "docs"},
+		{ID: "deploy", Role: "deploy"},
+		{ID: "notify", Role: "notify"},
+	}
+	if _, err := cronScheduler.AddFunc("0 2 * * 0", func() {
+		cronCtx, cronCancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cronCancel()
+		if cost, cerr := sum.CompressAll(cronCtx, summarizerConfigs); cerr != nil {
+			log.Error().Err(cerr).Msg("cron: CompressAll failed")
+		} else {
+			log.Info().Float64("cost_usd", cost).Msg("cron: CompressAll completed")
+		}
+	}); err != nil {
+		log.Error().Err(err).Msg("failed to schedule summarizer cron")
+	}
+	cronScheduler.Start()
+	defer cronScheduler.Stop()
+
 	httpServer := &http.Server{
 		Addr:    addr,
 		Handler: srv.Handler(),
@@ -289,6 +337,123 @@ func pollTrelloIdeas(
 			}
 		}
 	}
+}
+
+// initDefaultScopes seeds the ScopeManifest for each of the 10 default agents.
+// It writes every manifest unconditionally so that seeds stay up-to-date with
+// code changes (Write is atomic so there is no risk of partial reads).
+func initDefaultScopes(ss *state.ScopeStore) error {
+	manifests := []state.ScopeManifest{
+		{
+			AgentID:      "idea",
+			Owns:         []string{"memory/project.md (app concept section)"},
+			DependsOn:    []string{},
+			MustNotTouch: []string{"internal/", "cmd/", "go.mod"},
+			InterfacesWith: map[string]string{
+				"architect":  "passes structured app concept for system design",
+				"breakdown":  "concept is used as breakdown input",
+			},
+			CurrentFocus: "generate concrete, buildable app concepts from Trello briefs",
+		},
+		{
+			AgentID:      "architect",
+			Owns:         []string{"memory/project.md (ADR section)", "docs/architecture/"},
+			DependsOn:    []string{"idea"},
+			MustNotTouch: []string{"internal/", "cmd/", "go.mod"},
+			InterfacesWith: map[string]string{
+				"idea":      "receives app concept",
+				"breakdown": "passes Mermaid diagrams and ADRs for ticket decomposition",
+			},
+			CurrentFocus: "produce Mermaid diagrams, ERDs, API contracts, and ADRs",
+		},
+		{
+			AgentID:      "breakdown",
+			Owns:         []string{"Trello checklists and ticket JSON"},
+			DependsOn:    []string{"idea", "architect"},
+			MustNotTouch: []string{"internal/", "cmd/", "go.mod", "docs/architecture/"},
+			InterfacesWith: map[string]string{
+				"architect": "receives system design docs",
+				"coding":    "tickets are consumed by coding agents",
+				"test":      "tickets describe acceptance criteria for test agents",
+			},
+			CurrentFocus: "decompose app concept into actionable Trello tickets (max 10)",
+		},
+		{
+			AgentID:      "coding",
+			Owns:         []string{"internal/", "cmd/", "vendor/"},
+			DependsOn:    []string{"breakdown"},
+			MustNotTouch: []string{"docs/", "memory/project.md", "static/"},
+			InterfacesWith: map[string]string{
+				"breakdown": "receives implementation tickets",
+				"test":      "produces code that test agents verify",
+				"review":    "produces PRs that review agents inspect",
+			},
+			CurrentFocus: "implement features from tickets in idiomatic Go",
+		},
+		{
+			AgentID:      "test",
+			Owns:         []string{"*_test.go files", "testdata/"},
+			DependsOn:    []string{"coding"},
+			MustNotTouch: []string{"internal/ (non-test files)", "cmd/", "docs/", "memory/project.md"},
+			InterfacesWith: map[string]string{
+				"coding": "receives implementation code to write tests for",
+				"review": "test results inform the review decision",
+			},
+			CurrentFocus: "write table-driven tests covering edge cases and error paths",
+		},
+		{
+			AgentID:      "review",
+			Owns:         []string{"GitHub PR review comments"},
+			DependsOn:    []string{"coding", "test"},
+			MustNotTouch: []string{"internal/", "cmd/", "docs/", "memory/project.md"},
+			InterfacesWith: map[string]string{
+				"coding": "reviews PRs opened by coding agents",
+				"test":   "incorporates test results into review decision",
+				"deploy": "approved PRs are handed to deploy agent",
+			},
+			CurrentFocus: "review PRs for correctness, security, performance, and idiomatic Go",
+		},
+		{
+			AgentID:      "docs",
+			Owns:         []string{"docs/", "*.md files (except memory/project.md)"},
+			DependsOn:    []string{"coding"},
+			MustNotTouch: []string{"internal/", "cmd/", "go.mod", "memory/project.md"},
+			InterfacesWith: map[string]string{
+				"coding": "documents the code produced by coding agents",
+				"review": "documentation may be reviewed alongside code",
+			},
+			CurrentFocus: "generate README sections, godoc comments, API docs, and usage examples",
+		},
+		{
+			AgentID:      "deploy",
+			Owns:         []string{"Dockerfile", "docker-compose.yml", "Makefile (deploy targets)"},
+			DependsOn:    []string{"review"},
+			MustNotTouch: []string{"internal/", "cmd/", "docs/", "memory/project.md"},
+			InterfacesWith: map[string]string{
+				"review": "deploys after approved PR merge",
+				"notify": "signals deploy result to notify agent",
+			},
+			CurrentFocus: "execute deployment steps and verify health check",
+		},
+		{
+			AgentID:      "notify",
+			Owns:         []string{"Telegram/Slack notification messages"},
+			DependsOn:    []string{"deploy"},
+			MustNotTouch: []string{"internal/", "cmd/", "docs/", "memory/project.md"},
+			InterfacesWith: map[string]string{
+				"deploy": "receives deploy result to notify about",
+				"review": "notifies on PR review outcomes",
+			},
+			CurrentFocus: "send concise pipeline completion notifications to Telegram and Slack",
+		},
+	}
+
+	for _, m := range manifests {
+		if err := ss.Write(m); err != nil {
+			return fmt.Errorf("initDefaultScopes: %w", err)
+		}
+	}
+	return nil
 }
 
 // safeTruncate returns s[:maxLen] if len(s) >= maxLen, otherwise returns s as-is.

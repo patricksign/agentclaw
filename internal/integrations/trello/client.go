@@ -40,6 +40,72 @@ type Client struct {
 	http   *http.Client
 }
 
+// Card is the data needed to create a Trello card.
+type Card struct {
+	Name        string // card title (required)
+	Description string // card body / acceptance criteria
+	ListID      string // destination list ID (required)
+	Position    string // "top" | "bottom" (default: "bottom")
+}
+
+// CreatedCard is the Trello API response after card creation.
+type CreatedCard struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	ShortURL  string `json:"shortUrl"`
+	ShortLink string `json:"shortLink"`
+	IDList    string `json:"idList"`
+}
+
+// List represents a Trello list (column on a board).
+type List struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+// BoardCard is a card returned by the board cards endpoint.
+type BoardCard struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Desc         string   `json:"desc"`
+	ShortURL     string   `json:"shortUrl"`
+	IDList       string   `json:"idList"`
+	Labels       []Label  `json:"labels"`
+	IDLabelNames []string `json:"-"` // populated from Labels
+}
+
+// Label is a Trello label attached to a card.
+type Label struct {
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Color string `json:"color"`
+}
+
+// Ticket is the structured ticket produced by the breakdown agent LLM output.
+type Ticket struct {
+	Title              string   `json:"title"`
+	Description        string   `json:"description"`
+	AcceptanceCriteria string   `json:"acceptance_criteria"`
+	StoryPoints        int      `json:"story_points"`
+	DependsOn          []string `json:"depends_on"`
+}
+
+// Checklist represents a Trello checklist on a card.
+type Checklist struct {
+	ID         string      `json:"id"`
+	Name       string      `json:"name"`
+	IDCard     string      `json:"idCard"`
+	CheckItems []CheckItem `json:"checkItems"`
+}
+
+// CheckItem represents an item inside a Trello checklist.
+type CheckItem struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	State       string `json:"state"` // "complete" | "incomplete"
+	IDChecklist string `json:"idChecklist"`
+}
+
 // setAuth sets the OAuth Authorization header on the request and removes
 // key/token from the query string (if present). All Trello requests must
 // use this instead of embedding credentials in query parameters.
@@ -90,23 +156,6 @@ func New(apiKey, token string) (*Client, error) {
 	}, nil
 }
 
-// Card is the data needed to create a Trello card.
-type Card struct {
-	Name        string // card title (required)
-	Description string // card body / acceptance criteria
-	ListID      string // destination list ID (required)
-	Position    string // "top" | "bottom" (default: "bottom")
-}
-
-// CreatedCard is the Trello API response after card creation.
-type CreatedCard struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	ShortURL  string `json:"shortUrl"`
-	ShortLink string `json:"shortLink"`
-	IDList    string `json:"idList"`
-}
-
 // CreateCard creates a new card on the specified list.
 // Returns the created card including its URL.
 func (c *Client) CreateCard(ctx context.Context, card Card) (*CreatedCard, error) {
@@ -152,30 +201,6 @@ func (c *Client) CreateCard(ctx context.Context, card Card) (*CreatedCard, error
 		return nil, fmt.Errorf("trello: parse response: %w", err)
 	}
 	return &created, nil
-}
-
-// List represents a Trello list (column on a board).
-type List struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-}
-
-// BoardCard is a card returned by the board cards endpoint.
-type BoardCard struct {
-	ID           string   `json:"id"`
-	Name         string   `json:"name"`
-	Desc         string   `json:"desc"`
-	ShortURL     string   `json:"shortUrl"`
-	IDList       string   `json:"idList"`
-	Labels       []Label  `json:"labels"`
-	IDLabelNames []string `json:"-"` // populated from Labels
-}
-
-// Label is a Trello label attached to a card.
-type Label struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Color string `json:"color"`
 }
 
 // GetBoardCards returns all open (non-archived) cards on a board.
@@ -308,22 +333,6 @@ func (c *Client) GetCard(ctx context.Context, cardID string) (*BoardCard, error)
 
 // ─── Checklist operations ─────────────────────────────────────────────────────
 
-// Checklist represents a Trello checklist on a card.
-type Checklist struct {
-	ID         string      `json:"id"`
-	Name       string      `json:"name"`
-	IDCard     string      `json:"idCard"`
-	CheckItems []CheckItem `json:"checkItems"`
-}
-
-// CheckItem represents an item inside a Trello checklist.
-type CheckItem struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	State       string `json:"state"` // "complete" | "incomplete"
-	IDChecklist string `json:"idChecklist"`
-}
-
 // CreateChecklist creates a new checklist on a card and returns it.
 // POST /1/cards/{id}/checklists
 func (c *Client) CreateChecklist(ctx context.Context, cardID, name string) (*Checklist, error) {
@@ -420,15 +429,6 @@ func (c *Client) CompleteCheckItem(ctx context.Context, cardID, checkItemID stri
 }
 
 // ─── Ticket parsing ───────────────────────────────────────────────────────────
-
-// Ticket is the structured ticket produced by the breakdown agent LLM output.
-type Ticket struct {
-	Title              string   `json:"title"`
-	Description        string   `json:"description"`
-	AcceptanceCriteria string   `json:"acceptance_criteria"`
-	StoryPoints        int      `json:"story_points"`
-	DependsOn          []string `json:"depends_on"`
-}
 
 // ParseTickets parses the JSON array of tickets from LLM output.
 // The breakdown agent is prompted to return:

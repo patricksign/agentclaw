@@ -7,13 +7,17 @@ import (
 	"net/http"
 )
 
+const (
+	APPLICATION_JSON = "application/json"
+)
+
 // newGET builds a GET request with Accept: application/json.
 func newGET(ctx context.Context, url string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", APPLICATION_JSON)
 	return req, nil
 }
 
@@ -23,7 +27,7 @@ func newPOST(ctx context.Context, url string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", APPLICATION_JSON)
 	return req, nil
 }
 
@@ -33,7 +37,7 @@ func newPUT(ctx context.Context, url string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", APPLICATION_JSON)
 	return req, nil
 }
 
@@ -43,7 +47,7 @@ func newDELETE(ctx context.Context, url string) (*http.Request, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept", APPLICATION_JSON)
 	return req, nil
 }
 

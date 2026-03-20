@@ -4,10 +4,13 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/rs/zerolog/log"
+
 	"github.com/patricksign/agentclaw/internal/agent"
 	"github.com/patricksign/agentclaw/internal/state"
 )
@@ -17,12 +20,64 @@ type Store struct {
 	db          *sql.DB
 	projectPath string // path to project.md
 	resolved    *state.ResolvedStore
+	scope       *state.ScopeStore
+	agentDoc    *state.AgentDocStore
+	scratchpad  *state.Scratchpad
 }
 
 // Resolved returns the ResolvedStore for error pattern lookups and saves.
 // May be nil if the store was created without a state base directory.
 func (s *Store) Resolved() *state.ResolvedStore {
 	return s.resolved
+}
+
+// Scope returns the ScopeStore for agent scope manifests.
+// May be nil if the store was created without a state base directory.
+func (s *Store) Scope() *state.ScopeStore {
+	return s.scope
+}
+
+// AgentDoc returns the AgentDocStore for per-role memory files.
+// May be nil if the store was created without a state base directory.
+func (s *Store) AgentDoc() *state.AgentDocStore {
+	return s.agentDoc
+}
+
+// AppendAgentDoc appends an outcome summary to the role memory file.
+// No-ops silently if AgentDocStore was not initialised.
+func (s *Store) AppendAgentDoc(role, section string) error {
+	if s.agentDoc == nil {
+		return nil
+	}
+	return s.agentDoc.Append(role, section)
+}
+
+// Scratchpad returns the shared team scratchpad. May be nil.
+func (s *Store) Scratchpad() *state.Scratchpad {
+	return s.scratchpad
+}
+
+// AddScratchpadEntry appends an entry to the shared scratchpad.
+// No-ops silently if Scratchpad was not initialised.
+func (s *Store) AddScratchpadEntry(entry state.ScratchpadEntry) error {
+	if s.scratchpad == nil {
+		return nil
+	}
+	return s.scratchpad.AddEntry(entry)
+}
+
+// ReadScratchpadContext returns the compact 24 h context string for injection
+// into agent system prompts. Returns empty string if scratchpad is nil.
+func (s *Store) ReadScratchpadContext() string {
+	if s.scratchpad == nil {
+		return ""
+	}
+	ctx, err := s.scratchpad.ReadForContext()
+	if err != nil {
+		log.Warn().Err(err).Msg("ReadScratchpadContext failed")
+		return ""
+	}
+	return ctx
 }
 
 func New(dbPath, projectPath string) (*Store, error) {
@@ -49,6 +104,26 @@ func NewWithState(dbPath, projectPath, stateBaseDir string) (*Store, error) {
 			return nil, fmt.Errorf("memory: init resolved store: %w", rerr)
 		}
 		s.resolved = rs
+
+		ss, serr := state.NewScopeStore(stateBaseDir)
+		if serr != nil {
+			return nil, fmt.Errorf("memory: init scope store: %w", serr)
+		}
+		s.scope = ss
+
+		// Derive memoryBaseDir from stateBaseDir (sibling directory).
+		memoryBaseDir := filepath.Join(filepath.Dir(stateBaseDir), "memory")
+		ads, aerr := state.NewAgentDocStore(memoryBaseDir)
+		if aerr != nil {
+			return nil, fmt.Errorf("memory: init agent doc store: %w", aerr)
+		}
+		s.agentDoc = ads
+
+		sp, serr2 := state.NewScratchpad(stateBaseDir)
+		if serr2 != nil {
+			return nil, fmt.Errorf("memory: init scratchpad: %w", serr2)
+		}
+		s.scratchpad = sp
 	}
 	return s, nil
 }
@@ -67,6 +142,7 @@ func (s *Store) migrate() error {
 			description   TEXT,
 			agent_role    TEXT,
 			assigned_to   TEXT,
+			complexity    TEXT NOT NULL DEFAULT 'M',
 			status        TEXT NOT NULL DEFAULT 'pending',
 			priority      INTEGER NOT NULL DEFAULT 50,
 			depends_on    TEXT NOT NULL DEFAULT '',
@@ -139,15 +215,19 @@ func (s *Store) SaveTask(t *agent.Task) error {
 	deps := strings.Join(t.DependsOn, ",")
 	tags := strings.Join(t.Tags, ",")
 	id, title, desc, role, assigned := t.ID, t.Title, t.Description, t.AgentRole, t.AssignedTo
+	complexity := t.Complexity
+	if complexity == "" {
+		complexity = "M"
+	}
 	status, priority := t.Status, t.Priority
 	inTok, outTok, cost, retries, createdAt := t.InputTokens, t.OutputTokens, t.CostUSD, t.Retries, t.CreatedAt
 	t.Unlock()
 
 	_, err := s.db.Exec(`
 		INSERT OR REPLACE INTO tasks
-		(id,title,description,agent_role,assigned_to,status,priority,depends_on,tags,input_tokens,output_tokens,cost_usd,retries,created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		id, title, desc, role, assigned,
+		(id,title,description,agent_role,assigned_to,complexity,status,priority,depends_on,tags,input_tokens,output_tokens,cost_usd,retries,created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		id, title, desc, role, assigned, complexity,
 		status, priority, deps, tags,
 		inTok, outTok, cost, retries, createdAt,
 	)
@@ -266,37 +346,132 @@ func (s *Store) ListADRs() ([]string, error) {
 
 // ─── Build MemoryContext for agents ──────────────────────────────────────────
 
-// BuildContext assembles a full MemoryContext to inject into an agent before
-// running a task. It reads all three memory layers and attaches the
-// ResolvedStore for layer 4 (known error patterns).
-func (s *Store) BuildContext(role, taskTitle string) agent.MemoryContext {
+// truncateToTokens caps s at approximately maxTokens (1 token ≈ 4 chars).
+// If truncation occurs, "... [truncated]" is appended.
+func truncateToTokens(s string, maxTokens int) string {
+	maxChars := maxTokens * 4
+	if len(s) <= maxChars {
+		return s
+	}
+	return s[:maxChars] + "... [truncated]"
+}
+
+// BuildContext assembles a tiered MemoryContext based on task complexity.
+//
+// Complexity "S" — Tier 1 only (~500 tokens): AgentDoc, ScopeManifest, Scratchpad.
+// Complexity "M" — Tier 1 + Tier 2 (~1500 tokens total): adds RecentByRole(3),
+//
+//	ResolvedStore top-3 matches, first 800 chars of project.md.
+//
+// Complexity "L" — all tiers (~3000 tokens total): RecentByRole(5), full
+//
+//	project.md, ScopeStore.ReadAll() for cross-agent awareness.
+//
+// If complexity is empty it defaults to "M".
+func (s *Store) BuildContext(agentID, role, taskTitle, complexity string) agent.MemoryContext {
+	if complexity == "" {
+		complexity = "M"
+	}
 	ctx := agent.MemoryContext{}
 
-	// Layer 1: project doc
-	ctx.ProjectDoc = s.ReadProjectDoc()
+	// ── Tier 1 — always loaded ────────────────────────────────────────────
 
-	// Layer 2: recent tasks for the same role
-	recent, err := s.RecentByRole(role, 5)
-	if err == nil {
-		ctx.RecentTasks = recent
-	}
-
-	// Layer 3: RAG search from task title
-	related, err := s.SearchTasks(taskTitle, 3)
-	if err == nil {
-		for _, t := range related {
-			ctx.RelevantCode = append(ctx.RelevantCode,
-				fmt.Sprintf("[%s] %s: %s", t.Status, t.Title, t.Description)) //nolint:govet // t is *Task, no lock copied
+	// AgentDoc: role-specific conventions and pitfalls (cap 800 tokens).
+	if s.agentDoc != nil {
+		if doc, derr := s.agentDoc.Read(role); derr == nil {
+			ctx.AgentDoc = truncateToTokens(doc, 800)
+		} else {
+			log.Warn().Err(derr).Str("role", role).Msg("BuildContext: AgentDoc.Read failed")
 		}
 	}
 
-	// ADRs
-	adrs, err := s.ListADRs()
-	if err == nil {
-		ctx.ADRs = adrs
+	// ScopeManifest: what this agent owns / must not touch.
+	if s.scope != nil {
+		if m, serr := s.scope.Read(role); serr != nil {
+			log.Warn().Err(serr).Str("role", role).Msg("BuildContext: scope.Read failed")
+		} else {
+			ctx.Scope = m
+		}
 	}
 
-	// Layer 4: resolved error pattern store (may be nil — agents handle nil safely)
+	// Scratchpad: compact last-24 h team status (cap 400 tokens).
+	ctx.Scratchpad = s.scratchpad
+
+	// ── Tier 2 — M or L ──────────────────────────────────────────────────
+
+	// Read project doc once; tier determines the token cap applied below.
+	rawProjectDoc := s.ReadProjectDoc()
+
+	if complexity == "M" || complexity == "L" {
+		// RecentByRole: last 3 completed tasks for this role.
+		recent, err := s.RecentByRole(role, 3)
+		if err != nil {
+			log.Warn().Err(err).Str("role", role).Msg("BuildContext: RecentByRole failed")
+		} else {
+			for _, t := range recent {
+				t.Lock()
+				title, desc := t.Title, t.Description
+				status := t.Status
+				t.Unlock()
+				entry := truncateToTokens(fmt.Sprintf("[%s] %s: %s", status, title, desc), 300)
+				ctx.RelevantCode = append(ctx.RelevantCode, entry)
+			}
+			ctx.RecentTasks = recent
+		}
+
+		// ResolvedStore: top-3 matching error patterns (cap 200 tokens each).
+		if s.resolved != nil {
+			if matches, serr := s.resolved.Search(taskTitle, role); serr == nil {
+				top := matches
+				if len(top) > 3 {
+					top = top[:3]
+				}
+				for _, m := range top {
+					snippet := truncateToTokens(
+						fmt.Sprintf("**%s** (seen %d×)\nFix: %s", m.ErrorPattern, m.OccurrenceCount, m.ResolutionSummary),
+						200,
+					)
+					ctx.RelevantCode = append(ctx.RelevantCode, snippet)
+				}
+			}
+		}
+
+		// Project doc: first 800 tokens only.
+		ctx.ProjectDoc = truncateToTokens(rawProjectDoc, 800)
+	}
+
+	// ── Tier 3 — L only ──────────────────────────────────────────────────
+
+	if complexity == "L" {
+		// Extend to 5 recent tasks.
+		if full, err := s.RecentByRole(role, 5); err == nil {
+			ctx.RecentTasks = full
+		}
+
+		// Full project doc (cap 2000 tokens) — reuses the already-read rawProjectDoc.
+		ctx.ProjectDoc = truncateToTokens(rawProjectDoc, 2000)
+
+		// Cross-agent awareness via ScopeStore.ReadAll().
+		if s.scope != nil {
+			if all, aerr := s.scope.ReadAll(); aerr != nil {
+				log.Warn().Err(aerr).Msg("BuildContext: ScopeStore.ReadAll failed")
+			} else {
+				for i := range all {
+					ctx.AllScopes = append(ctx.AllScopes, &all[i])
+				}
+			}
+		}
+
+		// ADRs are only loaded at tier 3 to keep lower tiers lean.
+		adrs, err := s.ListADRs()
+		if err != nil {
+			log.Warn().Err(err).Msg("BuildContext: ListADRs failed")
+		} else {
+			ctx.ADRs = adrs
+		}
+	}
+
+	// ResolvedStore reference — agents use it directly for runtime lookups.
 	ctx.Resolved = s.resolved
 
 	return ctx
@@ -406,7 +581,7 @@ func (s *Store) StatsForRange(from, to string) (*PeriodStats, error) {
 // ListTasks returns all tasks ordered by created_at DESC.
 func (s *Store) ListTasks() ([]*agent.Task, error) {
 	rows, err := s.db.Query(`
-		SELECT id,title,description,agent_role,assigned_to,status,priority,
+		SELECT id,title,description,agent_role,assigned_to,complexity,status,priority,
 		       depends_on,tags,input_tokens,output_tokens,cost_usd,retries,
 		       created_at,started_at,finished_at
 		FROM tasks ORDER BY created_at DESC`)
@@ -429,7 +604,7 @@ func (s *Store) ListTasks() ([]*agent.Task, error) {
 // GetTask returns a single task by ID.
 func (s *Store) GetTask(id string) (*agent.Task, error) {
 	row := s.db.QueryRow(`
-		SELECT id,title,description,agent_role,assigned_to,status,priority,
+		SELECT id,title,description,agent_role,assigned_to,complexity,status,priority,
 		       depends_on,tags,input_tokens,output_tokens,cost_usd,retries,
 		       created_at,started_at,finished_at
 		FROM tasks WHERE id=?`, id)
@@ -445,7 +620,7 @@ func scanTask(row scannable) (*agent.Task, error) {
 	var deps, tags string
 	var startedAt, finishedAt sql.NullTime
 	err := row.Scan(
-		&t.ID, &t.Title, &t.Description, &t.AgentRole, &t.AssignedTo,
+		&t.ID, &t.Title, &t.Description, &t.AgentRole, &t.AssignedTo, &t.Complexity,
 		&t.Status, &t.Priority, &deps, &tags,
 		&t.InputTokens, &t.OutputTokens, &t.CostUSD, &t.Retries,
 		&t.CreatedAt, &startedAt, &finishedAt,

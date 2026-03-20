@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -143,6 +144,22 @@ func (a *BaseAgent) buildSystemPrompt(mem MemoryContext) string {
 	sb.WriteString(a.roleIdentity())
 	sb.WriteString("\n\n")
 
+	// Shared team scratchpad — last 24 h activity
+	if mem.Scratchpad != nil {
+		if teamStatus, err := mem.Scratchpad.ReadForContext(); err == nil && teamStatus != "" {
+			sb.WriteString("---\n## TEAM STATUS (last 24h)\n\n")
+			sb.WriteString(teamStatus)
+			sb.WriteString("\n")
+		}
+	}
+
+	// Role memory doc — per-agent conventions and pitfalls
+	if mem.AgentDoc != "" {
+		sb.WriteString("---\n## ROLE MEMORY\n\n")
+		sb.WriteString(mem.AgentDoc)
+		sb.WriteString("\n\n")
+	}
+
 	// Tầng 1: Project memory
 	if mem.ProjectDoc != "" {
 		sb.WriteString("---\n## PROJECT CONTEXT\n\n")
@@ -173,6 +190,58 @@ func (a *BaseAgent) buildSystemPrompt(mem MemoryContext) string {
 		sb.WriteString("---\n## ARCHITECTURE DECISIONS\n\n")
 		for _, adr := range mem.ADRs {
 			sb.WriteString("- " + adr + "\n")
+		}
+		sb.WriteString("\n")
+	}
+
+	// Scope manifest — owns, must_not_touch, interfaces_with, current_focus
+	if mem.Scope != nil {
+		sc := mem.Scope
+		sb.WriteString("---\n## MY SCOPE\n\n")
+		if len(sc.Owns) > 0 {
+			sb.WriteString("**Owns:**\n")
+			for _, o := range sc.Owns {
+				sb.WriteString("- " + o + "\n")
+			}
+			sb.WriteString("\n")
+		}
+		if len(sc.MustNotTouch) > 0 {
+			sb.WriteString("**Must NOT touch:**\n")
+			for _, m := range sc.MustNotTouch {
+				sb.WriteString("- " + m + "\n")
+			}
+			sb.WriteString("\n")
+		}
+		if len(sc.InterfacesWith) > 0 {
+			sb.WriteString("**Interfaces with:**\n")
+			ifaceKeys := make([]string, 0, len(sc.InterfacesWith))
+			for k := range sc.InterfacesWith {
+				ifaceKeys = append(ifaceKeys, k)
+			}
+			sort.Strings(ifaceKeys)
+			for _, k := range ifaceKeys {
+				sb.WriteString(fmt.Sprintf("- %s: %s\n", k, sc.InterfacesWith[k]))
+			}
+			sb.WriteString("\n")
+		}
+		if sc.CurrentFocus != "" {
+			sb.WriteString(fmt.Sprintf("**Current focus:** %s\n\n", sc.CurrentFocus))
+		}
+	}
+
+	// Cross-agent scope awareness (tier 3 only — populated when complexity=L)
+	if len(mem.AllScopes) > 0 {
+		sb.WriteString("---\n## TEAM SCOPE OVERVIEW\n\n")
+		for _, sc := range mem.AllScopes {
+			if sc == nil || sc.AgentID == a.cfg.ID {
+				continue // skip self — already shown in MY SCOPE
+			}
+			focus := sc.CurrentFocus
+			if focus == "" {
+				focus = "—"
+			}
+			sb.WriteString(fmt.Sprintf("- **%s**: owns %v | focus: %s\n",
+				sc.AgentID, sc.Owns, focus))
 		}
 		sb.WriteString("\n")
 	}
@@ -266,24 +335,54 @@ func (a *BaseAgent) roleOutputInstruction() string {
 	return "Return your output in a clear, structured format."
 }
 
+// taskSnapshot is a lock-free copy of the Task fields needed by buildUserMessage.
+type taskSnapshot struct {
+	id          string
+	title       string
+	description string
+	tags        []string
+	meta        map[string]string
+}
+
+// snapshotTask copies the fields needed for the user message under the task mutex.
+func snapshotTask(task *Task) taskSnapshot {
+	task.Lock()
+	defer task.Unlock()
+	// Copy slices and maps to avoid races after the lock is released.
+	tags := make([]string, len(task.Tags))
+	copy(tags, task.Tags)
+	meta := make(map[string]string, len(task.Meta))
+	for k, v := range task.Meta {
+		meta[k] = v
+	}
+	return taskSnapshot{
+		id:          task.ID,
+		title:       task.Title,
+		description: task.Description,
+		tags:        tags,
+		meta:        meta,
+	}
+}
+
 // ─── User message builder ─────────────────────────────────────────────────────
 
 func (a *BaseAgent) buildUserMessage(task *Task) string {
+	snap := snapshotTask(task)
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("**Task ID:** %s\n", task.ID))
-	sb.WriteString(fmt.Sprintf("**Title:** %s\n", task.Title))
+	sb.WriteString(fmt.Sprintf("**Task ID:** %s\n", snap.id))
+	sb.WriteString(fmt.Sprintf("**Title:** %s\n", snap.title))
 
-	if task.Description != "" {
-		sb.WriteString(fmt.Sprintf("\n**Description:**\n%s\n", task.Description))
+	if snap.description != "" {
+		sb.WriteString(fmt.Sprintf("\n**Description:**\n%s\n", snap.description))
 	}
 
-	if len(task.Tags) > 0 {
-		sb.WriteString(fmt.Sprintf("\n**Tags:** %s\n", strings.Join(task.Tags, ", ")))
+	if len(snap.tags) > 0 {
+		sb.WriteString(fmt.Sprintf("\n**Tags:** %s\n", strings.Join(snap.tags, ", ")))
 	}
 
-	if len(task.Meta) > 0 {
+	if len(snap.meta) > 0 {
 		sb.WriteString("\n**Additional context:**\n")
-		for k, v := range task.Meta {
+		for k, v := range snap.meta {
 			sb.WriteString(fmt.Sprintf("- %s: %s\n", k, v))
 		}
 	}
