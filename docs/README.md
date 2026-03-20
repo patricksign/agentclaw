@@ -4,7 +4,7 @@ An autonomous multi-agent pipeline that converts a Trello card into working code
 
 ## Vision
 
-AgentClaw orchestrates a team of specialised AI agents to execute a full software development cycle from a single Trello card. Each agent has a dedicated role (idea, breakdown, coding, test, docs, review, deploy, notify), shares memory across tasks, and communicates through a priority queue and real-time event bus. The system self-heals by learning from past failures and injecting known resolutions into future agent prompts.
+AgentClaw orchestrates a team of specialised AI agents to execute a full software development cycle from a single Trello card. Each agent has a dedicated role (idea, architect, breakdown, coding, test, review, docs, deploy, notify), shares memory across tasks, and communicates through a priority queue and real-time event bus. The system self-heals by learning from past failures and injecting known resolutions into future agent prompts.
 
 ## How It Works
 
@@ -65,7 +65,7 @@ Full Trello REST client with OAuth header authentication. The pipeline creates a
 For each coding task, the pipeline creates a feature branch (`feature/<task-id>-<title>`), opens a draft PR, and can submit reviews and merge. PR creation, review, and merge events are broadcast over the WebSocket event bus.
 
 ### 7. Real-Time Event Bus and WebSocket
-An in-process pub/sub event bus broadcasts agent lifecycle events (spawned, killed, healthy), task events (queued, started, done, failed), token usage logs, and PR events. A WebSocket endpoint (`/ws`) streams these events to the dashboard frontend. Origin validation is enforced against the `CORS_ORIGIN` environment variable.
+An in-process pub/sub event bus broadcasts agent lifecycle events (spawned, killed, healthy), task events (queued, started, done, failed), token usage logs, and PR events. A WebSocket endpoint (`/ws`) streams these events to the dashboard frontend. Origin validation is enforced against the `CORS_ORIGIN` environment variable. The `/ws` endpoint is **excluded from rate limiting**.
 
 ### 8. Telegram and Slack Notifications
 Nine notification methods covering task start, completion, failure, PR creation, PR review, PR merge, daily summary, checklist complete, and arbitrary HTML messages. Slack incoming webhook support is also included. Both clients are optional — the pipeline skips notifications silently if the env vars are absent.
@@ -75,6 +75,19 @@ The agent pool maintains a set of named agents, each with a health-check supervi
 
 ### 10. Metrics and Token Accounting
 Every LLM call is logged with input tokens, output tokens, cost in USD, and duration. Aggregated stats are available per day or per date range via the metrics API.
+
+### 11. Rolling Weekly History Compression
+A `Summarizer` (`internal/summarizer`) compresses each agent's completed task history into a 400-token memory document using Claude Sonnet. The summary is appended to `memory/agents/<role>.md` so future tasks benefit from accumulated institutional knowledge.
+
+- Loads the last 50 `done`/`failed` tasks per role; skips if fewer than 10 exist
+- Calls Sonnet with a focused system prompt: patterns used, pitfalls encountered, decisions made, modules touched
+- Archives the raw task list to `state/old/summary-<agentID>-<YYYY-MM-DD>.md`
+- Logs token usage and cost against the `summarizer-<agentID>` task ID
+- Scheduled automatically every **Sunday at 02:00** via `robfig/cron/v3`
+- Also triggerable on demand via `POST /api/state/compress`
+
+### 12. Per-IP Rate Limiting
+All REST endpoints are protected by a token-bucket rate limiter (10 requests per minute per IP). The WebSocket endpoint `/ws` is explicitly excluded. Clients that exceed the limit receive `HTTP 429` with a `Retry-After: 60` header. Idle IP buckets are purged every 5 minutes after 10 minutes of inactivity.
 
 ---
 
@@ -119,6 +132,12 @@ Every LLM call is logged with input tokens, output tokens, cost in USD, and dura
 | GET | `/api/state/resolved/:id` | Get full detail file for a pattern |
 | PATCH | `/api/state/resolved/:id/resolve` | Mark a pattern as resolved |
 
+### State / Compression
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/api/state/compress` | Compress agent history. Body: `{"agent_id":"","role":""}`. Empty `agent_id` compresses all roles. Returns `{"cost_usd": float, "summary_length": int}`. Requires `X-Admin-Token` header when `ADMIN_TOKEN` env var is set. |
+
 ### Metrics
 
 | Method | Path | Description |
@@ -130,7 +149,21 @@ Every LLM call is logged with input tokens, output tokens, cost in USD, and dura
 
 | Path | Description |
 |------|-------------|
-| `/ws` | Real-time event stream. Emits JSON `Event` objects for all agent and task lifecycle changes. |
+| `/ws` | Real-time event stream. Emits JSON `Event` objects for all agent and task lifecycle changes. Not rate-limited. |
+
+---
+
+## Rate Limiting
+
+All REST endpoints (excluding `/ws`) are rate-limited at **10 requests per minute per IP**.
+
+| Behaviour | Detail |
+|-----------|--------|
+| Algorithm | Token bucket — 10-token burst, refilled proportionally over 60 seconds |
+| Exceeded response | `HTTP 429 Too Many Requests` + `Retry-After: 60` header |
+| IP extraction | `r.RemoteAddr` (direct connections); set `X-Forwarded-For` / `X-Real-IP` via a trusted reverse proxy for per-client isolation |
+| Idle bucket cleanup | Every 5 minutes; buckets idle for more than 10 minutes are removed |
+| Excluded path | `/ws` — WebSocket connections are long-lived and manage their own lifecycle |
 
 ---
 
@@ -149,6 +182,8 @@ Every LLM call is logged with input tokens, output tokens, cost in USD, and dura
 | Notifications | Telegram Bot API (HTML mode) + Slack incoming webhook |
 | Source control | GitHub REST API v2022-11-28 |
 | Project boards | Trello REST API (OAuth header auth) |
+| Cron scheduler | `robfig/cron/v3` (weekly summary compression) |
+| Rate limiting | Stdlib token bucket (per-IP, no external dependency) |
 
 ---
 
@@ -175,6 +210,11 @@ Every LLM call is logged with input tokens, output tokens, cost in USD, and dura
 | `TELEGRAM_CHAT_ID` | Target Telegram chat or channel ID |
 | `SLACK_WEBHOOK_URL` | Slack incoming webhook URL |
 | `CORS_ORIGIN` | Allowed CORS origin (required for mutation endpoints and WebSocket) |
+| `ADMIN_TOKEN` | When set, `POST /api/state/compress` requires `X-Admin-Token: <value>` |
+| `DB_PATH` | SQLite database path (default: `./agentclaw.db`) |
+| `PROJECT_PATH` | Project memory document path (default: `./memory/project.md`) |
+| `SCOPE_PATH` | State base directory path (default: `./state`) |
+| `ADDR` | HTTP listen address (default: `:8080`) |
 
 ---
 
@@ -182,10 +222,10 @@ Every LLM call is logged with input tokens, output tokens, cost in USD, and dura
 
 ```
 agentclaw/
-├── cmd/agentclawd/         # Main entrypoint
+├── cmd/agentclawd/         # Main entrypoint (server, cron, dependency wiring)
 ├── internal/
 │   ├── agent/              # Agent types, pool, executor, event bus, base agent
-│   ├── api/                # HTTP server, WebSocket hub, route handlers
+│   ├── api/                # HTTP server, WebSocket hub, route handlers, rate limiter
 │   ├── integrations/
 │   │   ├── github/         # GitHub REST client (PRs, branches, reviews, merge)
 │   │   ├── pipeline/       # End-to-end pipeline orchestrator
@@ -194,12 +234,14 @@ agentclaw/
 │   ├── llm/                # LLM router (model selection, retry, cost tracking)
 │   ├── memory/             # 3-layer memory store (SQLite + project.md)
 │   ├── queue/              # Priority queue with dependency tracking
-│   ├── state/              # Resolved error pattern store (JSON files)
-│   └── trigger/            # Legacy pipeline trigger (superseded by pipeline/)
+│   ├── state/              # Resolved error pattern store, agent doc store, scratchpad
+│   └── summarizer/         # Rolling history compressor (Summarizer struct + interfaces)
 ├── state/
-│   └── resolved/           # Error pattern index and detail files (runtime)
+│   ├── resolved/           # Error pattern index and detail files (runtime)
+│   └── old/                # Archived raw task lists from weekly compression
 ├── memory/
-│   └── project.md          # Project memory document (agents read and write this)
+│   ├── project.md          # Project memory document (agents read and write this)
+│   └── agents/             # Per-role memory files (seeded defaults + appended summaries)
 ├── static/                 # Dashboard frontend
 └── docs/                   # Documentation
 ```
@@ -214,6 +256,10 @@ agentclaw/
 - **Per-role queue channels** — agents block on a role-specific `chan struct{}` rather than a global timer, giving O(1) wake-up latency when a matching task is pushed.
 - **`context.Background()` for background pipeline** — the trigger goroutine uses `context.Background()` so the HTTP request context cancellation does not abort the pipeline.
 - **WebSocket origin validation** — the upgrader checks the `Origin` header against `CORS_ORIGIN`; if unset, only same-host origins are accepted.
+- **Summarizer uses interfaces, not concrete types** — `TaskStore`, `DocStore`, and `LLMRouter` interfaces decouple `internal/summarizer` from `internal/memory` and `internal/state`, preventing import cycles while keeping the compressor testable in isolation.
+- **Token bucket with fractional-remainder preservation** — the rate limiter advances `lastSeen` by `refill * interval / max` instead of snapping to `now`, ensuring partial elapsed time accumulates correctly toward the next token and the effective rate is always exactly 10 req/min.
+- **Cleanup goroutine releases global lock before probing buckets** — the rate limiter snapshots IP pointers under `rl.mu`, releases it, then inspects each `bucket.mu` independently to avoid an O(n) stall on every cleanup tick.
+- **`sync.Once`-protected `Stop()`** — the rate limiter cleanup goroutine is safe to stop multiple times without panicking, which matters in tests that create and destroy `Server` instances.
 
 ---
 
