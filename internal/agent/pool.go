@@ -6,12 +6,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/rs/zerolog/log"
 )
 
 // deepCopyConfig returns a Config with independently copied slice and map fields
 // so that mutations of the original do not affect the saved restart config.
-func deepCopyConfig(c Config) Config {
+func deepCopyConfig(c adapter.Config) adapter.Config {
 	if c.Tags != nil {
 		tags := make([]string, len(c.Tags))
 		copy(tags, c.Tags)
@@ -29,14 +30,14 @@ func deepCopyConfig(c Config) Config {
 
 // AgentFactory creates a fresh Agent from a Config.
 // Injected into Pool so Restart() can create a new instance.
-type AgentFactory func(cfg Config) Agent
+type AgentFactory func(cfg adapter.Config) adapter.Agent
 
 // Pool manages the full lifecycle of agents.
 // Acts like a process supervisor — auto-restarts on crash.
 type Pool struct {
 	mu      sync.Mutex // single mutex prevents TOCTOU on Spawn/Kill/Restart
-	agents  map[string]Agent
-	configs map[string]Config // saved for Restart
+	agents  map[string]adapter.Agent
+	configs map[string]adapter.Config // saved for Restart
 	stopCh  map[string]chan struct{}
 	doneCh  map[string]chan struct{} // closed when supervise goroutine exits
 	bus     *EventBus
@@ -45,8 +46,8 @@ type Pool struct {
 
 func NewPool(bus *EventBus, factory AgentFactory) *Pool {
 	return &Pool{
-		agents:  make(map[string]Agent),
-		configs: make(map[string]Config),
+		agents:  make(map[string]adapter.Agent),
+		configs: make(map[string]adapter.Config),
 		stopCh:  make(map[string]chan struct{}),
 		doneCh:  make(map[string]chan struct{}),
 		bus:     bus,
@@ -55,7 +56,7 @@ func NewPool(bus *EventBus, factory AgentFactory) *Pool {
 }
 
 // Spawn adds an agent to the pool and starts its supervisor loop.
-func (p *Pool) Spawn(a Agent) error {
+func (p *Pool) Spawn(a adapter.Agent) error {
 	id := a.Config().ID
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -73,8 +74,8 @@ func (p *Pool) Spawn(a Agent) error {
 
 	go p.supervise(id, stop, done)
 
-	p.bus.Publish(Event{
-		Type:      EvtAgentSpawned,
+	p.bus.Publish(adapter.Event{
+		Type:      adapter.EvtAgentSpawned,
 		AgentID:   id,
 		Timestamp: time.Now(),
 	})
@@ -91,7 +92,8 @@ func (p *Pool) Kill(id string) error {
 
 // killLocked performs the actual kill. Caller must hold p.mu.
 // It temporarily releases p.mu while waiting for the supervise goroutine
-// to exit, then re-acquires it.
+// to exit, then re-acquires it. A sentinel value (nil agent) is placed in
+// the agents map to prevent Spawn from racing with the in-progress kill.
 func (p *Pool) killLocked(id string) error {
 	a, ok := p.agents[id]
 	if !ok {
@@ -100,6 +102,10 @@ func (p *Pool) killLocked(id string) error {
 
 	close(p.stopCh[id])
 	done := p.doneCh[id]
+
+	// Place a nil sentinel to prevent Spawn from re-using this ID while
+	// the supervisor is shutting down (TOCTOU guard).
+	p.agents[id] = nil
 
 	// Release the lock while waiting for the supervisor goroutine to exit,
 	// so it can acquire the lock if needed during its final tick.
@@ -116,8 +122,8 @@ func (p *Pool) killLocked(id string) error {
 	delete(p.stopCh, id)
 	delete(p.doneCh, id)
 
-	p.bus.Publish(Event{
-		Type:      EvtAgentKilled,
+	p.bus.Publish(adapter.Event{
+		Type:      adapter.EvtAgentKilled,
 		AgentID:   id,
 		Timestamp: time.Now(),
 	})
@@ -150,8 +156,8 @@ func (p *Pool) Restart(id string) error {
 
 	go p.supervise(id, stop, done)
 
-	p.bus.Publish(Event{
-		Type:      EvtAgentSpawned,
+	p.bus.Publish(adapter.Event{
+		Type:      adapter.EvtAgentSpawned,
 		AgentID:   id,
 		Timestamp: time.Now(),
 	})
@@ -162,7 +168,7 @@ func (p *Pool) Restart(id string) error {
 // SetStatus updates the in-pool status snapshot for an agent.
 // BaseAgent manages its own status internally; this is kept for
 // external overrides (e.g. marking an agent failed from the API).
-func (p *Pool) SetStatus(id string, s Status) {
+func (p *Pool) SetStatus(id string, s adapter.Status) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if a, ok := p.agents[id]; ok {
@@ -178,10 +184,10 @@ func (p *Pool) SetStatus(id string, s Status) {
 // always acquired after Pool.mu and never in the reverse order. All pool
 // methods that call agent methods (GetByRole, StatusAll, SetStatus) follow
 // this ordering. Do not acquire Pool.mu while holding an Agent.mu.
-func (p *Pool) StatusAll() map[string]Status {
+func (p *Pool) StatusAll() map[string]adapter.Status {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make(map[string]Status, len(p.agents))
+	out := make(map[string]adapter.Status, len(p.agents))
 	for id, a := range p.agents {
 		out[id] = a.Status()
 	}
@@ -189,7 +195,7 @@ func (p *Pool) StatusAll() map[string]Status {
 }
 
 // Get returns an agent by ID.
-func (p *Pool) Get(id string) (Agent, bool) {
+func (p *Pool) Get(id string) (adapter.Agent, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	a, ok := p.agents[id]
@@ -227,7 +233,7 @@ func (p *Pool) ShutdownAll(ctx context.Context) {
 
 	// Call OnShutdown on each agent now that supervisors are gone.
 	p.mu.Lock()
-	agents := make(map[string]Agent, len(p.agents))
+	agents := make(map[string]adapter.Agent, len(p.agents))
 	for id, a := range p.agents {
 		agents[id] = a
 	}
@@ -241,15 +247,15 @@ func (p *Pool) ShutdownAll(ctx context.Context) {
 
 // GetByRole returns agents for a given role, idle agents first.
 // Lock ordering: Pool.mu → Agent.mu (see StatusAll comment).
-func (p *Pool) GetByRole(role string) []Agent {
+func (p *Pool) GetByRole(role string) []adapter.Agent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var idle, busy []Agent
+	var idle, busy []adapter.Agent
 	for _, a := range p.agents {
 		if a.Config().Role != role {
 			continue
 		}
-		if a.Status() == StatusIdle {
+		if a.Status() == adapter.StatusIdle {
 			idle = append(idle, a)
 		} else {
 			busy = append(busy, a)
@@ -259,10 +265,10 @@ func (p *Pool) GetByRole(role string) []Agent {
 }
 
 // All returns a snapshot of all agents currently in the pool.
-func (p *Pool) All() []Agent {
+func (p *Pool) All() []adapter.Agent {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	out := make([]Agent, 0, len(p.agents))
+	out := make([]adapter.Agent, 0, len(p.agents))
 	for _, a := range p.agents {
 		out = append(out, a)
 	}
@@ -301,7 +307,7 @@ func (p *Pool) supervise(id string, stop <-chan struct{}, done chan struct{}) {
 				return
 			}
 
-			if a.Status() == StatusFailed {
+			if a.Status() == adapter.StatusFailed {
 				log.Warn().Str("agent", id).Msg("agent failed, restarting...")
 				newStop, newDone, err := p.restartFromSupervisor(id)
 				if err != nil {
@@ -321,15 +327,15 @@ func (p *Pool) supervise(id string, stop <-chan struct{}, done chan struct{}) {
 
 			if !healthy {
 				log.Warn().Str("agent", id).Msg("health check failed")
-				p.bus.Publish(Event{
-					Type:      EvtAgentFailed,
+				p.bus.Publish(adapter.Event{
+					Type:      adapter.EvtAgentFailed,
 					AgentID:   id,
 					Payload:   "health check failed",
 					Timestamp: time.Now(),
 				})
 			} else {
-				p.bus.Publish(Event{
-					Type:      EvtAgentHealthy,
+				p.bus.Publish(adapter.Event{
+					Type:      adapter.EvtAgentHealthy,
 					AgentID:   id,
 					Timestamp: time.Now(),
 				})
@@ -372,8 +378,8 @@ func (p *Pool) restartFromSupervisor(id string) (newStop <-chan struct{}, newDon
 	p.stopCh[id] = stop
 	p.doneCh[id] = done
 
-	p.bus.Publish(Event{
-		Type:      EvtAgentSpawned,
+	p.bus.Publish(adapter.Event{
+		Type:      adapter.EvtAgentSpawned,
 		AgentID:   id,
 		Timestamp: time.Now(),
 	})

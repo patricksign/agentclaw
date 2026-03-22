@@ -167,8 +167,8 @@ func providerForModel(model string) string {
 
 // Stats returns per-provider call counts.
 func (r *Router) Stats() map[string]int64 {
-	r.stats.mu.Lock()
-	defer r.stats.mu.Unlock()
+	r.stats.mu.RLock()
+	defer r.stats.mu.RUnlock()
 	out := make(map[string]int64, len(r.stats.calls))
 	for k, v := range r.stats.calls {
 		out[k] = v

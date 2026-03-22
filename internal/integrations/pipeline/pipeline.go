@@ -13,9 +13,9 @@
 //  3. Append concept to Trello card description.
 //  4. Breakdown Agent (claude-sonnet-4-6) → JSON task list (max 10).
 //  5. EnsureChecklist + PopulateChecklist on the card.
-//  6. For each task: call the role-appropriate LLM, mark checklist item,
-//     send Telegram notification, optionally create GitHub PR.
-//  7. Final Telegram notification (complete or partial summary).
+//  6. For each task: dispatch via event bus, wait for result,
+//     mark checklist item, optionally create GitHub PR.
+//  7. Final event (complete or partial summary).
 //
 // Required env vars:
 //
@@ -39,101 +39,38 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/domain"
 	"github.com/patricksign/AgentClaw/internal/integrations/github"
-	"github.com/patricksign/AgentClaw/internal/integrations/slack"
-	"github.com/patricksign/AgentClaw/internal/integrations/telegram"
 	"github.com/patricksign/AgentClaw/internal/integrations/trello"
-	"github.com/patricksign/AgentClaw/internal/queue"
+	"github.com/patricksign/AgentClaw/internal/port"
 	"github.com/rs/zerolog/log"
 )
 
 // Service orchestrates the AgentClaw agent pipeline.
+// Uses port interfaces — no direct dependency on agent/, queue/, telegram/, slack/.
 type Service struct {
-	trello   *trello.Client
-	telegram *telegram.Client
-	slack    *slack.SlackClient
-	github   *github.Client
-	// exec, q, and bus route tasks through the shared Pool/Queue/Executor
-	// instead of calling the LLM directly. All three must be non-nil for
-	// the queue-backed path to activate; if any is nil the service falls
-	// back to the direct-LLM path so it remains usable in tests.
-	exec *agent.Executor
-	q    *queue.Queue
-	bus  *agent.EventBus
+	trello     *trello.Client
+	github     *github.Client
+	dispatcher port.TaskDispatcher
+	waiter     port.TaskResultWaiter
+	eventBus   port.DomainEventBus
 }
 
-// NewService wires up all integration clients from environment variables.
-// Clients that are not configured (missing env vars) are left nil and their
-// pipeline steps are skipped silently.
-//
-// exec, q, and bus must be the same instances used by the main queue workers
-// so that tasks submitted here are executed by the Pool agents and tracked in
-// the shared memory store.
-func NewService(tc *trello.Client, exec *agent.Executor, q *queue.Queue, bus *agent.EventBus) *Service {
-	s := &Service{
-		trello: tc,
-		exec:   exec,
-		q:      q,
-		bus:    bus,
-	}
-
-	if tg, err := telegram.New(); err == nil {
-		s.telegram = tg
-	} else if telegram.IsEnvPresent() {
-		log.Warn().Err(err).Msg("pipeline: Telegram env vars present but client init failed")
-	}
-	if sl, err := slack.NewSlackClient(); err == nil {
-		s.slack = sl
-	} else if telegram.IsSlackEnvPresent() {
-		log.Warn().Err(err).Msg("pipeline: Slack env vars present but client init failed")
-	}
-	if github.IsConfigured() {
-		if gh, err := github.New(); err == nil {
-			s.github = gh
-		} else {
-			log.Warn().Err(err).Msg("pipeline: GitHub env vars present but client init failed")
-		}
-	}
-	return s
-}
-
-// submitAndWait submits a task to the shared queue, waits for it to complete
-// (via EventBus), and returns the LLM output captured in TaskResult.Output.
-//
-// This replaces the previous direct s.callLLM() calls so that every pipeline
-// task is executed by Pool agents, tracked in the memory store, and visible on
-// the WebSocket dashboard — exactly like tasks submitted via POST /api/tasks.
-func (s *Service) submitAndWait(ctx context.Context, t *agent.Task) (string, error) {
-	subID := "pipeline-waiter-" + uuid.New().String()[:8]
-	ch, unsub := s.bus.Subscribe(subID)
-	defer unsub()
-
-	s.q.Push(t)
-	_ = s.exec // ensure exec is wired (Push alone triggers the worker)
-
-	for {
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case evt, ok := <-ch:
-			if !ok {
-				return "", fmt.Errorf("pipeline: event bus closed before task %s completed", t.ID)
-			}
-			if evt.TaskID != t.ID {
-				continue
-			}
-			switch evt.Type {
-			case agent.EvtTaskDone:
-				if result, ok := evt.Payload.(*agent.TaskResult); ok && result != nil {
-					return result.Output, nil
-				}
-				return "", nil
-			case agent.EvtTaskFailed:
-				reason := fmt.Sprintf("%v", evt.Payload)
-				return "", fmt.Errorf("task %s failed: %s", t.ID, reason)
-			}
-		}
+// NewService wires up the pipeline with port-based dependencies.
+// Trello and GitHub clients are external API integrations (acceptable direct deps).
+func NewService(
+	tc *trello.Client,
+	gh *github.Client,
+	dispatcher port.TaskDispatcher,
+	waiter port.TaskResultWaiter,
+	eventBus port.DomainEventBus,
+) *Service {
+	return &Service{
+		trello:     tc,
+		github:     gh,
+		dispatcher: dispatcher,
+		waiter:     waiter,
+		eventBus:   eventBus,
 	}
 }
 
@@ -153,15 +90,20 @@ type pipelineTask struct {
 // ─── Run ──────────────────────────────────────────────────────────────────────
 
 // Run executes the full pipeline for the given Trello card.
-// All LLM calls are routed through the shared Pool/Queue/Executor so that
-// every task is memory-tracked, token-logged, and visible on the dashboard.
-// Intended to be called in a goroutine.
+// All task submission goes through port.TaskDispatcher; results via port.TaskResultWaiter.
+// Notifications are event-driven: subscribers on DomainEventBus handle Telegram/Slack.
 func (s *Service) Run(ctx context.Context, boardID, ticketID string) error {
 	logger := log.With().Str("ticket_id", ticketID).Str("board_id", boardID).Logger()
 
 	if s.trello == nil || !s.trello.IsConfigured() {
 		return fmt.Errorf("pipeline: Trello client not configured")
 	}
+
+	// Publish pipeline start event.
+	s.publishEvent(domain.EventPipelineStarted, "", map[string]string{
+		"board_id":  boardID,
+		"ticket_id": ticketID,
+	})
 
 	// ── Step 1: Fetch card ────────────────────────────────────────────────────
 	logger.Info().Msg("pipeline: fetching Trello card")
@@ -173,18 +115,16 @@ func (s *Service) Run(ctx context.Context, boardID, ticketID string) error {
 
 	// ── Step 2: Idea Agent ────────────────────────────────────────────────────
 	logger.Info().Msg("pipeline: step 2 — idea agent")
-	ideaTask := &agent.Task{
+	ideaTask := &domain.Task{
 		ID:          "pipeline-idea-" + uuid.New().String()[:8],
 		Title:       card.Name,
 		Description: fmt.Sprintf("**App Idea:**\nTitle: %s\n\nDescription:\n%s", card.Name, card.Desc),
 		AgentRole:   "idea",
 		Complexity:  "M",
-		Priority:    agent.PriorityHigh,
-		Status:      agent.TaskPending,
+		Status:      "pending",
 		CreatedAt:   time.Now(),
-		Meta:        map[string]string{"source": "pipeline", "trello_card_id": card.ID},
 	}
-	ideaOutput, err := s.submitAndWait(ctx, ideaTask)
+	ideaOutput, err := s.dispatchAndWait(ctx, ideaTask)
 	if err != nil {
 		return fmt.Errorf("pipeline: idea agent: %w", err)
 	}
@@ -203,18 +143,16 @@ func (s *Service) Run(ctx context.Context, boardID, ticketID string) error {
 
 	// ── Step 4: Breakdown Agent ───────────────────────────────────────────────
 	logger.Info().Msg("pipeline: step 4 — breakdown agent")
-	breakdownTask := &agent.Task{
+	breakdownTask := &domain.Task{
 		ID:          "pipeline-breakdown-" + uuid.New().String()[:8],
 		Title:       "Breakdown: " + card.Name,
 		Description: fmt.Sprintf("App concept:\n\n%s\n\nGenerate the task list now.", ideaOutput),
 		AgentRole:   "breakdown",
 		Complexity:  "M",
-		Priority:    agent.PriorityHigh,
-		Status:      agent.TaskPending,
+		Status:      "pending",
 		CreatedAt:   time.Now(),
-		Meta:        map[string]string{"source": "pipeline", "trello_card_id": card.ID},
 	}
-	breakdownOutput, err := s.submitAndWait(ctx, breakdownTask)
+	breakdownOutput, err := s.dispatchAndWait(ctx, breakdownTask)
 	if err != nil {
 		return fmt.Errorf("pipeline: breakdown agent: %w", err)
 	}
@@ -242,49 +180,62 @@ func (s *Service) Run(ctx context.Context, boardID, ticketID string) error {
 	}
 	logger.Info().Int("items", len(itemIDs)).Msg("pipeline: checklist populated")
 
-	// ── Step 6: Execute tasks via Pool/Queue ──────────────────────────────────
-	logger.Info().Msg("pipeline: step 6 — submitting tasks to queue")
+	// ── Step 6: Execute tasks via event-driven dispatch ───────────────────────
+	logger.Info().Msg("pipeline: step 6 — dispatching tasks")
 	type taskEntry struct {
 		pt     pipelineTask
-		qTask  *agent.Task
+		dTask  *domain.Task
 		itemID string
 	}
 	entries := make([]taskEntry, 0, len(tasks))
 	for i, pt := range tasks {
-		qTask := &agent.Task{
+		dTask := &domain.Task{
 			ID:          fmt.Sprintf("pipeline-%s-%s", pt.Role, uuid.New().String()[:8]),
 			Title:       pt.Title,
 			Description: fmt.Sprintf("**Task:** %s\n**Complexity:** %s\n\n**App Context:**\n%s", pt.Title, pt.Complexity, ideaOutput),
 			AgentRole:   pt.Role,
 			Complexity:  pt.Complexity,
-			Priority:    agent.PriorityNormal,
-			Status:      agent.TaskPending,
+			Status:      "pending",
 			CreatedAt:   time.Now(),
-			Meta:        map[string]string{"source": "pipeline", "trello_card_id": card.ID},
 		}
 		entries = append(entries, taskEntry{
 			pt:     pt,
-			qTask:  qTask,
+			dTask:  dTask,
 			itemID: itemIDs[titles[i]],
 		})
 	}
 
 	doneCount := 0
 	for i, entry := range entries {
+		// Short-circuit if context is already cancelled (e.g., shutdown).
+		if ctx.Err() != nil {
+			logger.Info().Err(ctx.Err()).Msg("pipeline: context cancelled — stopping task dispatch")
+			break
+		}
+
 		taskLogger := logger.With().
-			Str("task_id", entry.qTask.ID).
+			Str("task_id", entry.dTask.ID).
 			Str("role", entry.pt.Role).
 			Str("title", entry.pt.Title).
 			Logger()
-		taskLogger.Info().Msg("pipeline: submitting task")
+		taskLogger.Info().Msg("pipeline: dispatching task")
 
 		taskStart := time.Now()
-		s.notifyStarted(ctx, entry.pt)
 
-		output, taskErr := s.submitAndWait(ctx, entry.qTask)
+		// Publish task started event — subscribers handle notification.
+		s.publishEvent(domain.EventTaskStarted, entry.dTask.ID, map[string]string{
+			"title": entry.pt.Title,
+			"role":  entry.pt.Role,
+		})
+
+		output, taskErr := s.dispatchAndWait(ctx, entry.dTask)
 		if taskErr != nil {
 			taskLogger.Error().Err(taskErr).Msg("pipeline: task failed")
-			s.notifyFailed(ctx, entry.pt, taskErr.Error())
+			s.publishEvent(domain.EventTaskFailed, entry.dTask.ID, map[string]string{
+				"title":  entry.pt.Title,
+				"role":   entry.pt.Role,
+				"reason": taskErr.Error(),
+			})
 			continue
 		}
 
@@ -297,10 +248,14 @@ func (s *Service) Run(ctx context.Context, boardID, ticketID string) error {
 			}
 		}
 
-		s.notifyDone(ctx, entry.pt, durationMs)
+		s.publishEvent(domain.EventTaskDone, entry.dTask.ID, map[string]string{
+			"title":       entry.pt.Title,
+			"role":        entry.pt.Role,
+			"duration_ms": fmt.Sprintf("%d", durationMs),
+		})
 		doneCount++
 
-		// GitHub PR for coding tasks
+		// GitHub PR for coding tasks.
 		if entry.pt.Role == "coding" && s.github != nil {
 			baseBranch := "main"
 			prBody := fmt.Sprintf("## Task\n%s\n\n## Output\n```\n%s\n```", entry.pt.Title, truncate(output, 1000))
@@ -309,52 +264,92 @@ func (s *Service) Run(ctx context.Context, boardID, ticketID string) error {
 				taskLogger.Warn().Err(prErr).Msg("pipeline: failed to create GitHub PR")
 			} else {
 				taskLogger.Info().Str("pr_url", pr.HTMLURL).Int("pr_number", pr.Number).Msg("pipeline: PR created")
-				if s.telegram != nil {
-					_ = s.telegram.NotifyPRCreated(ctx, fmt.Sprintf("task-%d", i+1), pr.Title, pr.HTMLURL, pr.Number)
-				}
+				s.publishEvent(domain.EventPRCreated, entry.dTask.ID, map[string]string{
+					"pr_url":    pr.HTMLURL,
+					"pr_number": fmt.Sprintf("%d", pr.Number),
+					"pr_title":  pr.Title,
+					"branch":    fmt.Sprintf("task-%d", i+1),
+				})
 			}
 		}
 	}
 
-	// ── Step 7: Final notification ────────────────────────────────────────────
+	// ── Step 7: Final event ──────────────────────────────────────────────────
 	total := len(tasks)
 	logger.Info().Int("done", doneCount).Int("total", total).Msg("pipeline: all tasks processed")
 
-	if s.telegram != nil {
-		if doneCount == total {
-			_ = s.telegram.NotifyChecklistComplete(ctx, card.Name, card.ShortURL, doneCount)
-		} else {
-			_ = s.telegram.SendRaw(ctx, fmt.Sprintf(
-				"⚠️ <b>Pipeline Partial</b>\nCard: <a href=\"%s\">%s</a>\n%d/%d tasks succeeded",
-				card.ShortURL, card.Name, doneCount, total,
-			))
-		}
+	if doneCount == total {
+		s.publishEvent(domain.EventPipelineCompleted, "", map[string]string{
+			"card_name": card.Name,
+			"card_url":  card.ShortURL,
+			"done":      fmt.Sprintf("%d", doneCount),
+			"total":     fmt.Sprintf("%d", total),
+		})
+	} else {
+		s.publishEvent(domain.EventPipelinePartial, "", map[string]string{
+			"card_name": card.Name,
+			"card_url":  card.ShortURL,
+			"done":      fmt.Sprintf("%d", doneCount),
+			"total":     fmt.Sprintf("%d", total),
+		})
 	}
 
 	return nil
 }
 
-// ─── Notification helpers ─────────────────────────────────────────────────────
+// ─── Internal helpers ─────────────────────────────────────────────────────────
 
-func (s *Service) notifyStarted(ctx context.Context, t pipelineTask) {
-	if s.telegram == nil {
-		return
-	}
-	_ = s.telegram.NotifyTaskStarted(ctx, "pipeline", t.Role+"-"+t.Title, t.Title, t.Role)
+// preRegisterWaiter is an optional interface for race-free wait registration.
+// If the waiter supports it, we register BEFORE dispatching so no events are lost.
+type preRegisterWaiter interface {
+	RegisterAndWait(ctx context.Context, taskID string) func() (*domain.TaskResult, error)
 }
 
-func (s *Service) notifyDone(ctx context.Context, t pipelineTask, durationMs int64) {
-	if s.telegram == nil {
-		return
+// dispatchAndWait registers a wait channel BEFORE dispatching to prevent the race
+// where the task completes before the waiter is listening.
+func (s *Service) dispatchAndWait(ctx context.Context, task *domain.Task) (string, error) {
+	// Register the waiter synchronously BEFORE dispatch.
+	// This guarantees the wait channel exists when the event arrives.
+	var waitFn func() (*domain.TaskResult, error)
+	if prw, ok := s.waiter.(preRegisterWaiter); ok {
+		waitFn = prw.RegisterAndWait(ctx, task.ID)
 	}
-	_ = s.telegram.NotifyTaskDone(ctx, "pipeline", t.Role, t.Title, 0, 0, 0, durationMs)
+
+	// Dispatch the task.
+	if err := s.dispatcher.Dispatch(ctx, task); err != nil {
+		return "", fmt.Errorf("dispatch: %w", err)
+	}
+
+	// Wait for the result.
+	var result *domain.TaskResult
+	var err error
+	if waitFn != nil {
+		result, err = waitFn()
+	} else {
+		// Fallback for waiter implementations without pre-registration.
+		result, err = s.waiter.WaitForResult(ctx, task.ID)
+	}
+	if err != nil {
+		return "", err
+	}
+	if result == nil {
+		return "", nil
+	}
+	return result.Output, nil
 }
 
-func (s *Service) notifyFailed(ctx context.Context, t pipelineTask, reason string) {
-	if s.telegram == nil {
+// publishEvent is a convenience wrapper for bus.Publish.
+func (s *Service) publishEvent(evtType domain.EventType, taskID string, payload map[string]string) {
+	if s.eventBus == nil {
 		return
 	}
-	_ = s.telegram.NotifyTaskFailed(ctx, "pipeline", t.Role, t.Title, reason)
+	s.eventBus.Publish(domain.Event{
+		Type:       evtType,
+		Channel:    domain.StatusChannel,
+		TaskID:     taskID,
+		Payload:    payload,
+		OccurredAt: time.Now(),
+	})
 }
 
 // ─── Task list parser ─────────────────────────────────────────────────────────
@@ -362,7 +357,6 @@ func (s *Service) notifyFailed(ctx context.Context, t pipelineTask, reason strin
 // parseTaskList extracts the JSON array from LLM output, stripping any
 // markdown fences before parsing. Caps the result at 10 items.
 func parseTaskList(llmOutput string) ([]pipelineTask, error) {
-	// Strip markdown fences
 	llmOutput = strings.ReplaceAll(llmOutput, "```json", "")
 	llmOutput = strings.ReplaceAll(llmOutput, "```", "")
 

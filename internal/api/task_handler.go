@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/memory"
 	"github.com/rs/zerolog/log"
 )
@@ -24,6 +24,17 @@ func (s *Server) HandlerTask(mux *http.ServeMux) {
 
 // ─── Tasks ───────────────────────────────────────────────────────────────────
 
+// validAgentRoles is the canonical set of roles that agents can be assigned.
+var validAgentRoles = map[string]bool{
+	"idea": true, "architect": true, "breakdown": true,
+	"coding": true, "test": true, "review": true,
+	"docs": true, "deploy": true, "notify": true,
+}
+
+func isValidAgentRole(role string) bool {
+	return validAgentRoles[role]
+}
+
 func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -33,7 +44,7 @@ func (s *Server) listTasks(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if tasks == nil {
-			tasks = []*agent.Task{}
+			tasks = []*adapter.Task{}
 		}
 		writeJSON(w, http.StatusOK, tasks)
 	default:
@@ -45,12 +56,12 @@ func (s *Server) createTasks(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
 		var req struct {
-			Title       string         `json:"title"`
-			Description string         `json:"description"`
-			AgentRole   string         `json:"agent_role"`
-			Priority    agent.Priority `json:"priority"`
-			DependsOn   []string       `json:"depends_on"`
-			Tags        []string       `json:"tags"`
+			Title       string           `json:"title"`
+			Description string           `json:"description"`
+			AgentRole   string           `json:"agent_role"`
+			Priority    adapter.Priority `json:"priority"`
+			DependsOn   []string         `json:"depends_on"`
+			Tags        []string         `json:"tags"`
 		}
 		if err := readJSON(r, &req); err != nil {
 			errJSON(w, http.StatusBadRequest, "invalid JSON")
@@ -60,11 +71,17 @@ func (s *Server) createTasks(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, "title and agent_role required")
 			return
 		}
+		// Validate agent_role against the canonical set to prevent queue flooding
+		// with arbitrary roles that no agent will ever pick up.
+		if !isValidAgentRole(req.AgentRole) {
+			errJSON(w, http.StatusBadRequest, "invalid agent_role: must be one of idea, architect, breakdown, coding, test, review, docs, deploy, notify")
+			return
+		}
 		if req.Priority == 0 {
-			req.Priority = agent.PriorityNormal
+			req.Priority = adapter.PriorityNormal
 		}
 
-		task := &agent.Task{
+		task := &adapter.Task{
 			ID:          "T-" + strings.ReplaceAll(uuid.New().String(), "-", "")[:12],
 			Title:       req.Title,
 			Description: req.Description,
@@ -72,7 +89,7 @@ func (s *Server) createTasks(w http.ResponseWriter, r *http.Request) {
 			Priority:    req.Priority,
 			DependsOn:   req.DependsOn,
 			Tags:        req.Tags,
-			Status:      agent.TaskQueued,
+			Status:      adapter.TaskQueued,
 			CreatedAt:   time.Now(),
 		}
 
@@ -86,8 +103,8 @@ func (s *Server) createTasks(w http.ResponseWriter, r *http.Request) {
 		s.queue.Push(task)
 
 		// Broadcast event
-		s.bus.Publish(agent.Event{
-			Type:    agent.EvtTaskQueued,
+		s.events.Publish(adapter.Event{
+			Type:    adapter.EvtTaskQueued,
 			TaskID:  task.ID,
 			Payload: task,
 		})
@@ -128,15 +145,15 @@ func (s *Server) updateTaskById(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Status agent.TaskStatus `json:"status"`
+		Status adapter.TaskStatus `json:"status"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		errJSON(w, http.StatusBadRequest, "invalid JSON")
 		return
 	}
 	switch req.Status {
-	case agent.TaskPending, agent.TaskQueued, agent.TaskRunning,
-		agent.TaskDone, agent.TaskFailed, agent.TaskCancelled:
+	case adapter.TaskPending, adapter.TaskQueued, adapter.TaskRunning,
+		adapter.TaskDone, adapter.TaskFailed, adapter.TaskCancelled:
 		// valid
 	default:
 		errJSON(w, http.StatusBadRequest, "invalid status value")
@@ -152,16 +169,16 @@ func (s *Server) updateTaskById(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Map status to the correct event type instead of always emitting EvtTaskDone.
-	evtType := agent.EvtTaskDone
+	evtType := adapter.EvtTaskDone
 	switch req.Status {
-	case agent.TaskFailed:
-		evtType = agent.EvtTaskFailed
-	case agent.TaskQueued:
-		evtType = agent.EvtTaskQueued
-	case agent.TaskRunning:
-		evtType = agent.EvtTaskStarted
+	case adapter.TaskFailed:
+		evtType = adapter.EvtTaskFailed
+	case adapter.TaskQueued:
+		evtType = adapter.EvtTaskQueued
+	case adapter.TaskRunning:
+		evtType = adapter.EvtTaskStarted
 	}
-	s.bus.Publish(agent.Event{
+	s.events.Publish(adapter.Event{
 		Type:    evtType,
 		TaskID:  taskID,
 		Payload: task,

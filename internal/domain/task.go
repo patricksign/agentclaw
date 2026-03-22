@@ -7,11 +7,12 @@ import "time"
 type ExecutionPhase string
 
 const (
-	PhaseUnderstand ExecutionPhase = "understand"
-	PhaseClarify    ExecutionPhase = "clarify"
-	PhasePlan       ExecutionPhase = "plan"
-	PhaseImplement  ExecutionPhase = "implement"
-	PhaseDone       ExecutionPhase = "done"
+	PhaseIdeaClarify ExecutionPhase = "idea_clarify" // Phase 0: Opus asks human until all info collected
+	PhaseUnderstand  ExecutionPhase = "understand"
+	PhaseClarify     ExecutionPhase = "clarify"
+	PhasePlan        ExecutionPhase = "plan"
+	PhaseImplement   ExecutionPhase = "implement"
+	PhaseDone        ExecutionPhase = "done"
 )
 
 // Question is a clarification question raised during the understand phase.

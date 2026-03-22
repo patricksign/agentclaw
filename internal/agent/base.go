@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/domain"
 	"github.com/patricksign/AgentClaw/internal/integrations/trello"
 	"github.com/patricksign/AgentClaw/internal/llm"
@@ -23,8 +24,8 @@ import (
 // logic Run() được điều chỉnh tự động theo role.
 
 type BaseAgent struct {
-	cfg         Config
-	status      Status
+	cfg         adapter.Config
+	status      adapter.Status
 	router      *llm.Router
 	mu          sync.RWMutex
 	preExecDeps *PreExecutorDeps // injected via SetPreExecutorDeps; may be nil
@@ -33,7 +34,7 @@ type BaseAgent struct {
 // NewBaseAgent is the factory function called from main.go and Pool.Restart.
 // If cfg.Env contains API key overrides they take precedence over OS env vars,
 // allowing per-agent key configuration.
-func NewBaseAgent(cfg Config) Agent {
+func NewBaseAgent(cfg adapter.Config) adapter.Agent {
 	// Deep copy slice/map fields to ensure the agent owns its data exclusively.
 	// Callers (main.go) may reuse or share the original map/slice backing arrays.
 	if cfg.Env != nil {
@@ -57,7 +58,7 @@ func NewBaseAgent(cfg Config) Agent {
 	}
 	return &BaseAgent{
 		cfg:    cfg,
-		status: StatusIdle,
+		status: adapter.StatusIdle,
 		router: router,
 	}
 }
@@ -67,17 +68,17 @@ func NewBaseAgent(cfg Config) Agent {
 // Config returns a pointer to the agent's config. The config is immutable
 // after construction — callers MUST NOT mutate the returned value.
 // Returning a pointer avoids copying the Env map on every call (hot path).
-func (a *BaseAgent) Config() *Config {
+func (a *BaseAgent) Config() *adapter.Config {
 	return &a.cfg
 }
 
-func (a *BaseAgent) Status() Status {
+func (a *BaseAgent) Status() adapter.Status {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.status
 }
 
-func (a *BaseAgent) setStatus(s Status) {
+func (a *BaseAgent) setStatus(s adapter.Status) {
 	a.mu.Lock()
 	a.status = s
 	a.mu.Unlock()
@@ -89,16 +90,16 @@ func (a *BaseAgent) setStatus(s Status) {
 //
 // Returns (nil, nil) when the task is suspended (waiting for human input) —
 // the task will be re-dispatched once the answer arrives via ResumeTask.
-func (a *BaseAgent) Run(ctx context.Context, task *Task, mem MemoryContext) (*TaskResult, error) {
-	a.setStatus(StatusRunning)
-	defer a.setStatus(StatusIdle)
+func (a *BaseAgent) Run(ctx context.Context, task *adapter.Task, mem adapter.MemoryContext) (*adapter.TaskResult, error) {
+	a.setStatus(adapter.StatusRunning)
+	defer a.setStatus(adapter.StatusIdle)
 
 	start := time.Now()
 
 	// Initialise phase for new tasks.
 	task.Lock()
 	if task.Phase == "" {
-		task.Phase = PhaseUnderstand
+		task.Phase = adapter.PhaseUnderstand
 		task.PhaseStartedAt = time.Now()
 	}
 	task.Unlock()
@@ -107,7 +108,7 @@ func (a *BaseAgent) Run(ctx context.Context, task *Task, mem MemoryContext) (*Ta
 	task.Lock()
 	phase := task.Phase
 	task.Unlock()
-	if phase == PhaseUnderstand {
+	if phase == adapter.PhaseUnderstand {
 		if err := a.phaseUnderstand(ctx, task, mem); err != nil {
 			return nil, fmt.Errorf("understand phase: %w", err)
 		}
@@ -117,7 +118,7 @@ func (a *BaseAgent) Run(ctx context.Context, task *Task, mem MemoryContext) (*Ta
 	task.Lock()
 	phase = task.Phase
 	task.Unlock()
-	if phase == PhaseClarify {
+	if phase == adapter.PhaseClarify {
 		resolved, err := a.phaseClarify(ctx, task, mem)
 		if err != nil {
 			return nil, fmt.Errorf("clarify phase: %w", err)
@@ -132,7 +133,7 @@ func (a *BaseAgent) Run(ctx context.Context, task *Task, mem MemoryContext) (*Ta
 	task.Lock()
 	phase = task.Phase
 	task.Unlock()
-	if phase == PhasePlan {
+	if phase == adapter.PhasePlan {
 		approved, err := a.phasePlan(ctx, task, mem)
 		if err != nil {
 			return nil, fmt.Errorf("plan phase: %w", err)
@@ -147,7 +148,7 @@ func (a *BaseAgent) Run(ctx context.Context, task *Task, mem MemoryContext) (*Ta
 	task.Lock()
 	phase = task.Phase
 	task.Unlock()
-	if phase != PhaseImplement {
+	if phase != adapter.PhaseImplement {
 		return nil, fmt.Errorf("unexpected phase %s before implement", phase)
 	}
 
@@ -156,7 +157,10 @@ func (a *BaseAgent) Run(ctx context.Context, task *Task, mem MemoryContext) (*Ta
 
 // phaseImplement contains the original Run() implementation logic.
 // It is only reached after phaseUnderstand + phaseClarify + phasePlan all pass.
-func (a *BaseAgent) phaseImplement(ctx context.Context, task *Task, mem MemoryContext, start time.Time) (*TaskResult, error) {
+func (a *BaseAgent) phaseImplement(ctx context.Context,
+	task *adapter.Task,
+	mem adapter.MemoryContext,
+	start time.Time) (*adapter.TaskResult, error) {
 	task.Lock()
 	taskID := task.ID
 	taskTitle := task.Title
@@ -194,9 +198,9 @@ func (a *BaseAgent) phaseImplement(ctx context.Context, task *Task, mem MemoryCo
 
 	resp, err := a.router.Call(ctx, req)
 	if err != nil {
-		a.setStatus(StatusFailed)
+		a.setStatus(adapter.StatusFailed)
 		if d != nil && d.Telegram != nil {
-			go d.Telegram.NotifyImplementFailed(ctx, a.cfg.ID, taskID, taskTitle, err.Error())
+			go d.Telegram.NotifyImplementFailed(context.Background(), a.cfg.ID, taskID, taskTitle, err.Error())
 		}
 		return nil, fmt.Errorf("agent %s llm call failed: %w", a.cfg.ID, err)
 	}
@@ -205,7 +209,7 @@ func (a *BaseAgent) phaseImplement(ctx context.Context, task *Task, mem MemoryCo
 	artifacts := a.parseArtifacts(resp.Content, taskID)
 
 	duration := time.Since(start)
-	result := &TaskResult{
+	result := &adapter.TaskResult{
 		TaskID:       taskID,
 		Output:       resp.Content,
 		InputTokens:  resp.InputTokens,
@@ -221,7 +225,7 @@ func (a *BaseAgent) phaseImplement(ctx context.Context, task *Task, mem MemoryCo
 
 	// 5. Mark phase done.
 	task.Lock()
-	task.Phase = PhaseDone
+	task.Phase = adapter.PhaseDone
 	task.Unlock()
 	a.saveTask(task)
 
@@ -251,7 +255,9 @@ func (a *BaseAgent) phaseImplement(ctx context.Context, task *Task, mem MemoryCo
 // reflectAndLearn asks the LLM to reflect on the completed task and extracts
 // lessons learned, new patterns, and anti-patterns. These are applied to the
 // SkillStore so future tasks benefit from accumulated experience.
-func (a *BaseAgent) reflectAndLearn(ctx context.Context, task *Task, mem MemoryContext, result *TaskResult, success bool) {
+func (a *BaseAgent) reflectAndLearn(ctx context.Context,
+	task *adapter.Task, mem adapter.MemoryContext,
+	result *adapter.TaskResult, success bool) {
 	if mem.SkillStore == nil || result == nil {
 		return
 	}
@@ -349,11 +355,11 @@ Be specific. Max 3 items per array.`
 }
 
 func (a *BaseAgent) HealthCheck(_ context.Context) bool {
-	return a.Status() != StatusFailed
+	return a.Status() != adapter.StatusFailed
 }
 
 func (a *BaseAgent) OnShutdown(_ context.Context) {
-	a.setStatus(StatusTerminated)
+	a.setStatus(adapter.StatusTerminated)
 	log.Info().Str("agent", a.cfg.ID).Msg("agent shutdown")
 }
 
@@ -361,7 +367,7 @@ func (a *BaseAgent) OnShutdown(_ context.Context) {
 
 // buildSystemPrompt inject toàn bộ memory context vào system prompt
 // Đây là cơ chế "không bao giờ quên" của agents
-func (a *BaseAgent) buildSystemPrompt(mem MemoryContext) string {
+func (a *BaseAgent) buildSystemPrompt(mem adapter.MemoryContext) string {
 	// Preallocate ~8 KiB — typical system prompt size for M-complexity tasks.
 	// Avoids 4-5 reallocation+copy cycles during string building.
 	var sb strings.Builder
@@ -586,7 +592,7 @@ type taskSnapshot struct {
 }
 
 // snapshotTask copies the fields needed for the user message under the task mutex.
-func snapshotTask(task *Task) taskSnapshot {
+func snapshotTask(task *adapter.Task) taskSnapshot {
 	task.Lock()
 	defer task.Unlock()
 	// Copy slices and maps to avoid races after the lock is released.
@@ -607,7 +613,7 @@ func snapshotTask(task *Task) taskSnapshot {
 
 // ─── User message builder ─────────────────────────────────────────────────────
 
-func (a *BaseAgent) buildUserMessage(task *Task) string {
+func (a *BaseAgent) buildUserMessage(task *adapter.Task) string {
 	snap := snapshotTask(task)
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("**Task ID:** %s\n", snap.id))
@@ -656,13 +662,13 @@ func (a *BaseAgent) maxTokensForRole() int {
 
 // parseArtifacts finds artifacts in LLM response content.
 // Takes taskID directly to avoid accessing task fields without lock.
-func (a *BaseAgent) parseArtifacts(content string, taskID string) []Artifact {
-	var artifacts []Artifact
+func (a *BaseAgent) parseArtifacts(content string, taskID string) []adapter.Artifact {
+	var artifacts []adapter.Artifact
 
 	// PR URL pattern
 	if strings.Contains(content, "github.com") && strings.Contains(content, "/pull/") {
-		artifacts = append(artifacts, Artifact{
-			Kind: ArtifactPR,
+		artifacts = append(artifacts, adapter.Artifact{
+			Kind: adapter.ArtifactPR,
 			URL:  extractFirstURL(content, "github.com"),
 			Meta: map[string]string{"task_id": taskID},
 		})
@@ -670,8 +676,8 @@ func (a *BaseAgent) parseArtifacts(content string, taskID string) []Artifact {
 
 	// Trello card URL
 	if strings.Contains(content, "trello.com/c/") {
-		artifacts = append(artifacts, Artifact{
-			Kind: ArtifactTrello,
+		artifacts = append(artifacts, adapter.Artifact{
+			Kind: adapter.ArtifactTrello,
 			URL:  extractFirstURL(content, "trello.com"),
 			Meta: map[string]string{"task_id": taskID},
 		})
@@ -684,7 +690,7 @@ func (a *BaseAgent) parseArtifacts(content string, taskID string) []Artifact {
 // breakdown agent output. Only activates for agents with role "breakdown".
 // Pass the Trello client and the target list ID at startup.
 func TrelloBreakdownHook(client *trello.Client, listID string) PostRunHook {
-	return func(ctx context.Context, a Agent, task *Task, result *TaskResult) {
+	return func(ctx context.Context, a adapter.Agent, task *adapter.Task, result *adapter.TaskResult) {
 		if a.Config().Role != "breakdown" || result == nil {
 			return
 		}
@@ -715,8 +721,8 @@ func TrelloBreakdownHook(client *trello.Client, listID string) PostRunHook {
 			log.Info().Str("card", card.ID).Str("url", card.ShortURL).
 				Str("title", card.Name).Msg("trello card created")
 
-			result.Artifacts = append(result.Artifacts, Artifact{
-				Kind: ArtifactTrello,
+			result.Artifacts = append(result.Artifacts, adapter.Artifact{
+				Kind: adapter.ArtifactTrello,
 				URL:  card.ShortURL,
 				Meta: map[string]string{
 					"task_id":    task.ID,

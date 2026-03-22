@@ -5,11 +5,12 @@ import (
 
 	"github.com/patricksign/AgentClaw/internal/agent"
 	"github.com/patricksign/AgentClaw/internal/integrations/telegram"
-	"github.com/patricksign/AgentClaw/internal/usecase/escalation"
+	"github.com/patricksign/AgentClaw/internal/port"
 )
 
-// Compile-time check: ReplyAdapter implements escalation.HumanAsker.
-var _ escalation.HumanAsker = (*ReplyAdapter)(nil)
+// Compile-time check: ReplyAdapter implements port.HumanAsker.
+// clean-arch: infra imports port (not usecase) for interface compliance.
+var _ port.HumanAsker = (*ReplyAdapter)(nil)
 
 // ReplyAdapter adapts the existing agent.ReplyStore + telegram.DualChannelClient
 // to satisfy the escalation.HumanAsker interface.
@@ -35,4 +36,9 @@ func (a *ReplyAdapter) AskHuman(ctx context.Context, agentID, taskID, taskTitle,
 // that will receive the human's answer.
 func (a *ReplyAdapter) RegisterReply(msgID int, taskID, questionID string) <-chan string {
 	return a.replies.Register(msgID, taskID, questionID)
+}
+
+// UnregisterReply removes a pending reply registration to prevent channel leak on timeout.
+func (a *ReplyAdapter) UnregisterReply(msgID int) {
+	a.replies.UnregisterByMsgID(msgID)
 }

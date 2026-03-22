@@ -10,12 +10,6 @@ import (
 	"github.com/patricksign/AgentClaw/internal/port"
 )
 
-// HumanAsker abstracts the human notification channel (Telegram, Slack, etc.).
-type HumanAsker interface {
-	AskHuman(ctx context.Context, agentID, taskID, taskTitle, questionID, question string) (msgID int, err error)
-	RegisterReply(msgID int, taskID, questionID string) <-chan string
-}
-
 // Chain implements port.Escalator using a multi-level resolution strategy:
 // cache → next-tier model → higher-tier model → … → human.
 //
@@ -27,7 +21,7 @@ type Chain struct {
 	router     port.LLMRouter
 	notifier   port.Notifier
 	cache      *Cache
-	asker      HumanAsker
+	asker      port.HumanAsker // clean-arch: interface in port/, not usecase/
 	checkpoint port.CheckpointStore
 }
 
@@ -36,7 +30,7 @@ func NewChain(
 	router port.LLMRouter,
 	notifier port.Notifier,
 	cache *Cache,
-	asker HumanAsker,
+	asker port.HumanAsker,
 	checkpoint port.CheckpointStore,
 ) *Chain {
 	return &Chain{
@@ -159,6 +153,9 @@ func (c *Chain) Resolve(ctx context.Context, req port.EscalatorRequest) (domain.
 
 		return domain.EscalationResult{Answer: answer, AnsweredBy: domain.ModelHuman, Resolved: true}, nil
 	case <-waitCtx.Done():
+		// Unregister the pending reply to prevent channel and map entry leak.
+		// If a human replies later, nobody will read the channel.
+		c.asker.UnregisterReply(msgID)
 		return domain.EscalationResult{NeedsHuman: true}, nil
 	}
 }
@@ -203,10 +200,12 @@ func (c *Chain) dispatch(ctx context.Context, evtType domain.EventType, ch domai
 	})
 }
 
-// truncate returns the first n characters of s, appending "…" if truncated.
+// truncate returns the first n runes of s, appending "…" if truncated.
+// Uses rune-based length to avoid splitting multi-byte UTF-8 characters.
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n] + "…"
+	return string(runes[:n]) + "…"
 }

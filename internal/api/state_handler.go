@@ -5,8 +5,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
-	"github.com/patricksign/AgentClaw/internal/summarizer"
+	"github.com/patricksign/AgentClaw/internal/domain"
 	"github.com/rs/zerolog/log"
 )
 
@@ -20,11 +19,6 @@ var knownRoles = []string{
 // HandlerState registers the state management endpoints.
 func (s *Server) HandlerState(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/state/compress", cors(s.compressState))
-}
-
-// SetSummarizer attaches a Summarizer to the server after construction.
-func (s *Server) SetSummarizer(sum *summarizer.Summarizer) {
-	s.summarizer = sum
 }
 
 func (s *Server) compressState(w http.ResponseWriter, r *http.Request) {
@@ -58,9 +52,9 @@ func (s *Server) compressState(w http.ResponseWriter, r *http.Request) {
 
 	if req.AgentID == "" {
 		// Compress all known roles.
-		configs := make([]agent.Config, 0, len(knownRoles))
+		configs := make([]domain.AgentConfig, 0, len(knownRoles))
 		for _, role := range knownRoles {
-			configs = append(configs, agent.Config{ID: role, Role: role})
+			configs = append(configs, domain.AgentConfig{ID: role, Role: role})
 		}
 		cost, err := s.summarizer.CompressAll(ctx, configs)
 		if err != nil {

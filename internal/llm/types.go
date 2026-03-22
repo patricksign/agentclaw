@@ -67,12 +67,15 @@ type FallbackNotifyFunc func(evt FallbackEvent)
 // Keys in env override the corresponding environment variables, allowing
 // per-agent API key configuration without touching the global environment.
 type Router struct {
-	client     *http.Client
-	env        map[string]string  // per-agent key overrides (optional)
-	breakers   *breakerRegistry   // per-provider circuit breakers
-	onFallback FallbackNotifyFunc // called on fallback/exhaustion events (optional)
-	stats      struct {
-		mu    sync.Mutex
+	client   *http.Client
+	env      map[string]string // per-agent key overrides (optional)
+	breakers *breakerRegistry  // per-provider circuit breakers
+	fallback struct {
+		mu sync.RWMutex
+		fn FallbackNotifyFunc
+	}
+	stats struct {
+		mu    sync.RWMutex
 		calls map[string]int64 // provider → call count
 	}
 }

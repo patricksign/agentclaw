@@ -13,7 +13,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/rs/zerolog/log"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/domain"
 	"github.com/patricksign/AgentClaw/internal/state"
 )
@@ -185,6 +185,8 @@ func (s *Store) migratePreExecColumns() error {
 	for _, col := range cols {
 		// SQLite does not support IF NOT EXISTS on ALTER TABLE ADD COLUMN,
 		// so we attempt the ALTER and ignore "duplicate column" errors.
+		// SAFETY: col.name and col.definition are hardcoded constants above —
+		// never derived from user input. Do not refactor to accept external values.
 		_, err := s.db.Exec(fmt.Sprintf(
 			"ALTER TABLE tasks ADD COLUMN %s %s", col.name, col.definition,
 		))
@@ -227,7 +229,7 @@ func (s *Store) AppendProjectDoc(section string) error {
 
 // ─── LAYER 2: Task History ────────────────────────────────────────────────────
 
-func (s *Store) SaveTask(t *agent.Task) error {
+func (s *Store) SaveTask(t *adapter.Task) error {
 	t.Lock()
 	deps := strings.Join(t.DependsOn, ",")
 	tags := strings.Join(t.Tags, ",")
@@ -298,16 +300,16 @@ func marshalJSONField(v any) (string, error) {
 	return string(b), nil
 }
 
-func (s *Store) UpdateTaskStatus(id string, status agent.TaskStatus) error {
+func (s *Store) UpdateTaskStatus(id string, status adapter.TaskStatus) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
 	now := time.Now()
 	switch status {
-	case agent.TaskRunning:
+	case adapter.TaskRunning:
 		_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, started_at=? WHERE id=?`, status, now, id)
 		return err
-	case agent.TaskDone, agent.TaskFailed:
+	case adapter.TaskDone, adapter.TaskFailed:
 		_, err := s.db.ExecContext(ctx, `UPDATE tasks SET status=?, finished_at=? WHERE id=?`, status, now, id)
 		return err
 	default:
@@ -330,7 +332,7 @@ func (s *Store) AddTokens(taskID string, in, out int64, cost float64) error {
 }
 
 // RecentByRole returns the N most recent completed tasks for a given role.
-func (s *Store) RecentByRole(role string, n int) ([]*agent.Task, error) {
+func (s *Store) RecentByRole(role string, n int) ([]*adapter.Task, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -343,9 +345,9 @@ func (s *Store) RecentByRole(role string, n int) ([]*agent.Task, error) {
 	}
 	defer rows.Close()
 
-	var tasks []*agent.Task
+	var tasks []*adapter.Task
 	for rows.Next() {
-		t := &agent.Task{}
+		t := &adapter.Task{}
 		if err := rows.Scan(&t.ID, &t.Title, &t.Description, &t.AgentRole, &t.Status, &t.CostUSD, &t.CreatedAt); err != nil {
 			return nil, fmt.Errorf("RecentByRole scan: %w", err)
 		}
@@ -364,7 +366,7 @@ func escapeLike(s string) string {
 }
 
 // SearchTasks finds completed tasks matching the query in title or description.
-func (s *Store) SearchTasks(query string, limit int) ([]*agent.Task, error) {
+func (s *Store) SearchTasks(query string, limit int) ([]*adapter.Task, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -378,9 +380,9 @@ func (s *Store) SearchTasks(query string, limit int) ([]*agent.Task, error) {
 	}
 	defer rows.Close()
 
-	var tasks []*agent.Task
+	var tasks []*adapter.Task
 	for rows.Next() {
-		t := &agent.Task{}
+		t := &adapter.Task{}
 		if err := rows.Scan(&t.ID, &t.Title, &t.Description, &t.AgentRole, &t.Status, &t.CostUSD, &t.CreatedAt); err != nil {
 			return nil, fmt.Errorf("SearchTasks scan: %w", err)
 		}
@@ -456,7 +458,7 @@ var maxContextTokens = map[string]int{
 // context and proportionally trims the largest sections if the budget is exceeded.
 // Fields are trimmed in priority order (lowest priority trimmed first):
 // ADRs → RelevantCode → ProjectDoc → AgentDoc (never trimmed below 200 tokens).
-func enforceTokenBudget(ctx *agent.MemoryContext, budget int) {
+func enforceTokenBudget(ctx *adapter.MemoryContext, budget int) {
 	type section struct {
 		ptr      *string
 		name     string
@@ -580,8 +582,16 @@ func (s *Store) LoadCheckpoint(taskID string) (*domain.PhaseCheckpoint, error) {
 	}
 
 	cp.Phase = domain.ExecutionPhase(phase)
-	_ = json.Unmarshal([]byte(accum), &cp.Accumulated)
-	_ = json.Unmarshal([]byte(msgs), &cp.LastMessages)
+	if accum != "" {
+		if err := json.Unmarshal([]byte(accum), &cp.Accumulated); err != nil {
+			return nil, fmt.Errorf("load checkpoint %s: unmarshal accumulated: %w", taskID, err)
+		}
+	}
+	if msgs != "" {
+		if err := json.Unmarshal([]byte(msgs), &cp.LastMessages); err != nil {
+			return nil, fmt.Errorf("load checkpoint %s: unmarshal last_messages: %w", taskID, err)
+		}
+	}
 
 	return &cp, nil
 }
@@ -694,7 +704,7 @@ const taskSelectCols = `id,title,description,agent_role,assigned_to,complexity,s
        COALESCE(redirect_count,0),phase_started_at`
 
 // ListTasks returns all tasks ordered by created_at DESC.
-func (s *Store) ListTasks() ([]*agent.Task, error) {
+func (s *Store) ListTasks() ([]*adapter.Task, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -704,7 +714,7 @@ func (s *Store) ListTasks() ([]*agent.Task, error) {
 	}
 	defer rows.Close()
 
-	var tasks []*agent.Task
+	var tasks []*adapter.Task
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {
@@ -716,7 +726,7 @@ func (s *Store) ListTasks() ([]*agent.Task, error) {
 }
 
 // GetTask returns a single task by ID.
-func (s *Store) GetTask(id string) (*agent.Task, error) {
+func (s *Store) GetTask(id string) (*adapter.Task, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -725,7 +735,7 @@ func (s *Store) GetTask(id string) (*agent.Task, error) {
 }
 
 // ListTasksByPhase returns all tasks in a given execution phase that have the given status.
-func (s *Store) ListTasksByPhase(phase agent.ExecutionPhase, status agent.TaskStatus) ([]*agent.Task, error) {
+func (s *Store) ListTasksByPhase(phase adapter.ExecutionPhase, status adapter.TaskStatus) ([]*adapter.Task, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancel()
 
@@ -738,7 +748,7 @@ func (s *Store) ListTasksByPhase(phase agent.ExecutionPhase, status agent.TaskSt
 	}
 	defer rows.Close()
 
-	var tasks []*agent.Task
+	var tasks []*adapter.Task
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {
@@ -753,8 +763,8 @@ type scannable interface {
 	Scan(...any) error
 }
 
-func scanTask(row scannable) (*agent.Task, error) {
-	t := &agent.Task{}
+func scanTask(row scannable) (*adapter.Task, error) {
+	t := &adapter.Task{}
 	var deps, tags string
 	var startedAt, finishedAt, phaseStartedAt sql.NullTime
 	var phase, understanding, assumptions, risks, questions string
@@ -786,7 +796,7 @@ func scanTask(row scannable) (*agent.Task, error) {
 	}
 
 	// Pre-execution protocol fields.
-	t.Phase = agent.ExecutionPhase(phase)
+	t.Phase = adapter.ExecutionPhase(phase)
 	t.Understanding = understanding
 	t.ImplementPlan = implementPlan
 	t.PlanApprovedBy = planApprovedBy

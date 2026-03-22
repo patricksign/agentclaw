@@ -97,6 +97,32 @@ func (r *ReplyStore) ResolveByTask(taskID, answer string) bool {
 	return true
 }
 
+// UnregisterByMsgID removes a pending entry by msgID only (without needing taskID).
+// Used to clean up when a timeout expires and the caller only has the msgID.
+// Closes the channel to unblock any readers.
+func (r *ReplyStore) UnregisterByMsgID(msgID int) {
+	r.mu.Lock()
+	entry, ok := r.byMsgID[msgID]
+	if !ok {
+		r.mu.Unlock()
+		return
+	}
+	taskID := entry.taskID
+	delete(r.byMsgID, msgID)
+	msgs := r.byTask[taskID]
+	for i, id := range msgs {
+		if id == msgID {
+			r.byTask[taskID] = append(msgs[:i], msgs[i+1:]...)
+			break
+		}
+	}
+	if len(r.byTask[taskID]) == 0 {
+		delete(r.byTask, taskID)
+	}
+	r.mu.Unlock()
+	close(entry.ch)
+}
+
 // Unregister removes a pending entry by msgID and taskID without sending an answer.
 // Used to clean up when AskHuman fails after a pre-emptive Register(0, ...) call.
 func (r *ReplyStore) Unregister(msgID int, taskID string) {

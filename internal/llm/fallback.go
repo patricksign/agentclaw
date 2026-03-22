@@ -73,14 +73,20 @@ func (r *Router) callWithFallback(ctx context.Context, req Request, chain []stri
 }
 
 // notifyFallback calls the registered callback if set.
+// Thread-safe: reads fn under RLock.
 func (r *Router) notifyFallback(evt FallbackEvent) {
-	if r.onFallback != nil {
-		r.onFallback(evt)
+	r.fallback.mu.RLock()
+	fn := r.fallback.fn
+	r.fallback.mu.RUnlock()
+	if fn != nil {
+		fn(evt)
 	}
 }
 
 // SetFallbackNotifier registers a callback for fallback events.
-// This is the bridge between the llm package and the notification system.
+// Thread-safe: writes fn under Lock.
 func (r *Router) SetFallbackNotifier(fn FallbackNotifyFunc) {
-	r.onFallback = fn
+	r.fallback.mu.Lock()
+	r.fallback.fn = fn
+	r.fallback.mu.Unlock()
 }

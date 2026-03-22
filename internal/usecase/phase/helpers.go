@@ -11,9 +11,11 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+// notifyTimeout caps how long a fire-and-forget notification goroutine can run.
+const notifyTimeout = 10 * time.Second
+
 // saveCheckpoint persists a phase checkpoint if a CheckpointStore is available.
-// Best-effort: errors are silently ignored because checkpoint loss is recoverable
-// (the phase would simply re-run from scratch on next resume).
+// Logs a warning on failure — silent loss of checkpoint means tasks cannot resume after crash.
 func saveCheckpoint(pctx PhaseContext, taskID string, phase domain.ExecutionPhase, stepIndex int, stepName string, accumulated map[string]string) {
 	if pctx.CheckpointStore == nil {
 		return
@@ -27,7 +29,12 @@ func saveCheckpoint(pctx PhaseContext, taskID string, phase domain.ExecutionPhas
 		Accumulated:    accumulated,
 		SuspendedModel: pctx.AgentCfg.Model,
 	}
-	_ = pctx.CheckpointStore.Save(cp)
+	if err := pctx.CheckpointStore.Save(cp); err != nil {
+		log.Warn().Err(err).
+			Str("task", taskID).
+			Str("phase", string(phase)).
+			Msg("checkpoint save failed — task may not be resumable after crash")
+	}
 }
 
 // loadCheckpoint retrieves a previously saved checkpoint for a task.
@@ -52,14 +59,16 @@ func deleteCheckpoint(pctx PhaseContext, taskID string) {
 }
 
 // dispatchEvent fires an event via the notifier in a goroutine (non-blocking).
-// Used for status updates that should not slow down the pipeline.
-// Errors are logged but do not affect the caller.
-func dispatchEvent(ctx context.Context, notifier port.Notifier, evt domain.Event) {
+// Uses a fresh context with timeout instead of the caller's context, which may
+// be cancelled before the goroutine runs (go-validator: critical concurrency issue).
+func dispatchEvent(_ context.Context, notifier port.Notifier, evt domain.Event) {
 	if evt.OccurredAt.IsZero() {
 		evt.OccurredAt = time.Now()
 	}
 	go func() {
-		if err := notifier.Dispatch(ctx, evt); err != nil {
+		notifyCtx, cancel := context.WithTimeout(context.Background(), notifyTimeout)
+		defer cancel()
+		if err := notifier.Dispatch(notifyCtx, evt); err != nil {
 			log.Warn().Err(err).
 				Str("event", string(evt.Type)).
 				Str("task", evt.TaskID).

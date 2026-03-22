@@ -3,25 +3,27 @@ package agent
 import (
 	"sync"
 	"time"
+
+	"github.com/patricksign/AgentClaw/internal/adapter"
 )
 
 // EventBus is a simple in-process pub/sub using channels.
 // All components subscribe to receive events (WebSocket, metrics, logger...).
 type EventBus struct {
 	mu   sync.RWMutex
-	subs map[string]chan Event
+	subs map[string]chan adapter.Event
 }
 
 func NewEventBus() *EventBus {
 	return &EventBus{
-		subs: make(map[string]chan Event),
+		subs: make(map[string]chan adapter.Event),
 	}
 }
 
 // Subscribe registers a receiver — returns a channel and an unsubscribe func.
 // The caller MUST call unsub when done to avoid goroutine/channel leaks.
-func (b *EventBus) Subscribe(id string) (<-chan Event, func()) {
-	ch := make(chan Event, 64)
+func (b *EventBus) Subscribe(id string) (<-chan adapter.Event, func()) {
+	ch := make(chan adapter.Event, 64)
 	b.mu.Lock()
 	b.subs[id] = ch
 	b.mu.Unlock()
@@ -42,7 +44,7 @@ func (b *EventBus) Subscribe(id string) (<-chan Event, func()) {
 
 // Publish sends an event to all current subscribers.
 // Non-blocking: slow subscribers are dropped, not blocked.
-func (b *EventBus) Publish(evt Event) {
+func (b *EventBus) Publish(evt adapter.Event) {
 	if evt.Timestamp.IsZero() {
 		evt.Timestamp = time.Now()
 	}

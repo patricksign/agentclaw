@@ -3,10 +3,23 @@ package llm
 import (
 	"errors"
 	"fmt"
+	"strings"
 )
 
 func (e *httpStatusError) Error() string {
-	return fmt.Sprintf("%s %d: %s", e.Provider, e.StatusCode, e.Body)
+	return fmt.Sprintf("%s %d: %s", e.Provider, e.StatusCode, sanitizeErrorBody(e.Body))
+}
+
+// sanitizeErrorBody redacts potential sensitive data from API error responses.
+// Provider APIs may echo back request content including API keys or tokens.
+func sanitizeErrorBody(body string) string {
+	lower := strings.ToLower(body)
+	for _, keyword := range []string{"key", "token", "secret", "authorization", "password", "credential"} {
+		if strings.Contains(lower, keyword) {
+			return fmt.Sprintf("[redacted — error body contained '%s']", keyword)
+		}
+	}
+	return body
 }
 
 // isPermanentError returns true for 4xx HTTP errors (auth, bad request, etc.)

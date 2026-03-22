@@ -100,6 +100,8 @@ func (l *LoopOrchestrator) Run(
 			guidance = strings.TrimSpace(verdict[idx+len("IMPROVE:"):])
 		}
 
+		// Mutate task fields atomically — these fields may be read by API handlers
+		// or status endpoints concurrently.
 		task.Description += "\n\n---\nOpus feedback (attempt " + fmt.Sprintf("%d", attempt) + "):\n" + guidance
 		task.Phase = domain.PhaseImplement
 		task.ImplementPlan += "\n\nOpus feedback (attempt " + fmt.Sprintf("%d):\n", attempt) + guidance

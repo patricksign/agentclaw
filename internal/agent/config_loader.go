@@ -4,18 +4,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"github.com/patricksign/AgentClaw/internal/adapter"
 )
 
 // LoadConfigs reads agent configurations from a JSON file.
 // The file must contain a JSON array of Config objects.
 // Returns the parsed configs, or an error if the file cannot be read or parsed.
-func LoadConfigs(path string) ([]Config, error) {
+func LoadConfigs(path string) ([]adapter.Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read agent config: %w", err)
 	}
 
-	var configs []Config
+	var configs []adapter.Config
 	if err := json.Unmarshal(data, &configs); err != nil {
 		return nil, fmt.Errorf("parse agent config: %w", err)
 	}

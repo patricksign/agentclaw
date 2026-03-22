@@ -1,9 +1,11 @@
 package api
 
 import (
+	"crypto/subtle"
 	"net/http"
+	"os"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 )
 
 func (s *Server) HandlerAgent(mux *http.ServeMux) {
@@ -20,8 +22,8 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	// Method already enforced by mux pattern "GET /api/agents".
 	statuses := s.pool.StatusAll()
 	type agentInfo struct {
-		ID     string       `json:"id"`
-		Status agent.Status `json:"status"`
+		ID     string         `json:"id"`
+		Status adapter.Status `json:"status"`
 	}
 	out := make([]agentInfo, 0, len(statuses))
 	for id, st := range statuses {
@@ -30,8 +32,26 @@ func (s *Server) handleAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
-// POST /api/agents/{id}/restart — restart agent
+// requireAdminTokenFromReq checks the X-Admin-Token header against the ADMIN_TOKEN env var.
+// Returns true if authorised (or no token is configured). Writes 401 and returns false otherwise.
+func requireAdminTokenFromReq(w http.ResponseWriter, r *http.Request) bool {
+	adminToken := os.Getenv("ADMIN_TOKEN")
+	if adminToken == "" {
+		return true
+	}
+	got := r.Header.Get("X-Admin-Token")
+	if subtle.ConstantTimeCompare([]byte(got), []byte(adminToken)) != 1 {
+		errJSON(w, http.StatusUnauthorized, "unauthorized — X-Admin-Token required")
+		return false
+	}
+	return true
+}
+
+// POST /api/agents/{id}/restart — restart agent (requires admin token)
 func (s *Server) handleRestartAgent(w http.ResponseWriter, r *http.Request) {
+	if !requireAdminTokenFromReq(w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		errJSON(w, http.StatusBadRequest, "missing agent id")
@@ -44,8 +64,11 @@ func (s *Server) handleRestartAgent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "restarted"})
 }
 
-// POST /api/agents/{id}/kill — kill agent
+// POST /api/agents/{id}/kill — kill agent (requires admin token)
 func (s *Server) handleKillAgent(w http.ResponseWriter, r *http.Request) {
+	if !requireAdminTokenFromReq(w, r) {
+		return
+	}
 	id := r.PathValue("id")
 	if id == "" {
 		errJSON(w, http.StatusBadRequest, "missing agent id")

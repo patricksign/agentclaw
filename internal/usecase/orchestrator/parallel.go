@@ -75,9 +75,9 @@ func (p *ParallelOrchestrator) Run(
 		OccurredAt: time.Now(),
 	})
 
-	// Use errgroup with concurrency limit but WITHOUT context cancellation
-	// on first error — we want partial results.
-	group, gctx := errgroup.WithContext(ctx)
+	// Plain errgroup (not WithContext) — we do NOT want cancel-on-first-error.
+	// Failed tasks should not cancel siblings; we collect partial results.
+	var group errgroup.Group
 	if p.maxConcurrency > 0 {
 		group.SetLimit(p.maxConcurrency)
 	}
@@ -102,7 +102,7 @@ func (p *ParallelOrchestrator) Run(
 				TaskStore:  p.taskStore,
 				StateStore: p.statStore,
 			}
-			result, err := p.runner.Run(gctx, pctx)
+			result, err := p.runner.Run(ctx, pctx)
 			if err != nil {
 				// Record the error but do NOT return it — returning error
 				// from errgroup.Go cancels the group context for all goroutines.

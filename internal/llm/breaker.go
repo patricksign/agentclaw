@@ -3,11 +3,12 @@ package llm
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // circuitState represents the state of a circuit breaker.
-type circuitState int
+type circuitState int32
 
 const (
 	circuitClosed   circuitState = iota // normal operation
@@ -21,15 +22,15 @@ const (
 // the breaker closes; if it fails, it opens again.
 //
 // Uses atomic state for the fast path (circuitClosed) to avoid mutex
-// contention when all providers are healthy.
+// contention when all providers are healthy — the common case.
 type breaker struct {
-	mu        sync.Mutex
-	state     circuitState
-	failures  int
-	threshold int
-	cooldown  time.Duration
-	openedAt  time.Time
-	lastErr   error
+	atomicState int32 // atomic fast path — matches circuitState values
+	mu          sync.Mutex
+	failures    int
+	threshold   int
+	cooldown    time.Duration
+	openedAt    time.Time
+	lastErr     error
 }
 
 func newBreaker(threshold int, cooldown time.Duration) *breaker {
@@ -41,16 +42,21 @@ func newBreaker(threshold int, cooldown time.Duration) *breaker {
 
 // allow checks whether a request should proceed.
 // Returns an error if the circuit is open (caller should not make the request).
+// Fast path: atomic check for circuitClosed avoids mutex on every healthy call.
 func (b *breaker) allow() error {
+	if circuitState(atomic.LoadInt32(&b.atomicState)) == circuitClosed {
+		return nil // fast path — no mutex needed when healthy
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	switch b.state {
+	switch circuitState(atomic.LoadInt32(&b.atomicState)) {
 	case circuitClosed:
 		return nil
 	case circuitOpen:
 		if time.Since(b.openedAt) >= b.cooldown {
-			b.state = circuitHalfOpen
+			atomic.StoreInt32(&b.atomicState, int32(circuitHalfOpen))
 			return nil // allow one probe
 		}
 		return fmt.Errorf("circuit open for provider (last error: %v), retry after %v",
@@ -67,8 +73,8 @@ func (b *breaker) recordSuccess() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.failures = 0
-	b.state = circuitClosed
 	b.lastErr = nil
+	atomic.StoreInt32(&b.atomicState, int32(circuitClosed))
 }
 
 // recordFailure increments the failure counter and opens the circuit if threshold is reached.
@@ -78,7 +84,7 @@ func (b *breaker) recordFailure(err error) {
 	b.failures++
 	b.lastErr = err
 	if b.failures >= b.threshold {
-		b.state = circuitOpen
+		atomic.StoreInt32(&b.atomicState, int32(circuitOpen))
 		b.openedAt = time.Now()
 	}
 }

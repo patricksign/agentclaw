@@ -5,13 +5,13 @@ import (
 	"context"
 	"sync"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 )
 
 // ─── Priority heap impl ───────────────────────────────────────────────────────
 
 type item struct {
-	task  *agent.Task
+	task  *adapter.Task
 	index int
 }
 
@@ -75,7 +75,7 @@ func (q *Queue) roleChannel(role string) chan struct{} {
 
 // Push adds a task to the queue. Duplicate task IDs (already in queue or
 // already done) are silently dropped to prevent re-processing.
-func (q *Queue) Push(task *agent.Task) {
+func (q *Queue) Push(task *adapter.Task) {
 	q.mu.Lock()
 	// Dedup: skip if this task ID is already queued or already completed.
 	if q.inQueue[task.ID] || q.doneIDs[task.ID] {
@@ -101,7 +101,7 @@ func (q *Queue) Push(task *agent.Task) {
 }
 
 // Pop blocks until a task matching role is ready (all deps done) or ctx is cancelled.
-func (q *Queue) Pop(ctx context.Context, role string) (*agent.Task, error) {
+func (q *Queue) Pop(ctx context.Context, role string) (*adapter.Task, error) {
 	// Obtain role-specific channel under lock.
 	q.mu.Lock()
 	roleCh := q.roleChannel(role)
@@ -185,12 +185,12 @@ func (q *Queue) recordDone(id string) {
 
 // MarkFailed re-enqueues the task if retries remain.
 // maxRetries must be a fixed value — do NOT pass task.Retries+N.
-func (q *Queue) MarkFailed(task *agent.Task, maxRetries int) {
+func (q *Queue) MarkFailed(task *adapter.Task, maxRetries int) {
 	task.Lock()
 	task.Retries++
 	shouldRetry := task.Retries <= maxRetries
 	if shouldRetry {
-		task.Status = agent.TaskQueued
+		task.Status = adapter.TaskQueued
 	}
 	task.Unlock()
 
@@ -218,7 +218,7 @@ func (q *Queue) Len() int {
 // When a role is specified, uses the roleIndex to scan only tasks for that role
 // instead of the entire heap — O(role_count) instead of O(n).
 // Must be called under mu.Lock.
-func (q *Queue) findReady(role string) *agent.Task {
+func (q *Queue) findReady(role string) *adapter.Task {
 	var candidates []*item
 	if role != "" {
 		candidates = q.roleIndex[role]
@@ -227,7 +227,7 @@ func (q *Queue) findReady(role string) *agent.Task {
 	}
 
 	bestIdx := -1
-	var bestPri agent.Priority
+	var bestPri adapter.Priority
 	var bestItem *item
 	staleCount := 0
 

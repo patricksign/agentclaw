@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -13,24 +13,16 @@ import (
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/api"
 	"github.com/patricksign/AgentClaw/internal/domain"
-	infraintegrations "github.com/patricksign/AgentClaw/internal/infra/integrations"
-	infrallm "github.com/patricksign/AgentClaw/internal/infra/llm"
-	inframemory "github.com/patricksign/AgentClaw/internal/infra/memory"
-	infranotification "github.com/patricksign/AgentClaw/internal/infra/notification"
-	infrastate "github.com/patricksign/AgentClaw/internal/infra/state"
-	"github.com/patricksign/AgentClaw/internal/integrations/telegram"
+	infratask "github.com/patricksign/AgentClaw/internal/infra/task"
+	"github.com/patricksign/AgentClaw/internal/integrations/github"
+	"github.com/patricksign/AgentClaw/internal/integrations/pipeline"
 	"github.com/patricksign/AgentClaw/internal/integrations/trello"
 	"github.com/patricksign/AgentClaw/internal/llm"
-	"github.com/patricksign/AgentClaw/internal/memory"
-	"github.com/patricksign/AgentClaw/internal/queue"
 	"github.com/patricksign/AgentClaw/internal/state"
 	"github.com/patricksign/AgentClaw/internal/summarizer"
-	"github.com/patricksign/AgentClaw/internal/usecase/escalation"
-	"github.com/patricksign/AgentClaw/internal/usecase/orchestrator"
-	"github.com/patricksign/AgentClaw/internal/usecase/phase"
 )
 
 const maxTaskRetries = 3
@@ -47,207 +39,94 @@ func main() {
 	pricingPath := getenv("PRICING_PATH", "./pricing/agent-pricing.json")
 	agentsConfigPath := getenv("AGENTS_CONFIG", "./config/agents.json")
 
-	// ── Layer 4: Infrastructure — LLM ──────────────────────────────────────
-	if err := llm.LoadPricing(pricingPath); err != nil {
-		log.Warn().Err(err).Str("path", pricingPath).Msg("failed to load pricing — cost tracking will report $0")
-	} else {
-		log.Info().Str("path", pricingPath).Msg("model pricing loaded")
-	}
+	// ── Layer 4: Infrastructure ───────────────────────────────────────────
+	infra, cleanupInfra := wireInfra(pricingPath, statePath, dbPath, projectPath)
+	defer cleanupInfra()
 
-	// Core LLM router (used by existing agent layer)
-	coreLLMRouter := llm.NewRouter()
+	// ── Layer 2: Use Cases ────────────────────────────────────────────────
+	_ = wireUseCase(infra)
 
-	// Infra LLM router adapter (satisfies port.LLMRouter)
-	llmRouter := infrallm.NewRouter(coreLLMRouter)
+	// ── Legacy Agent Layer ────────────────────────────────────────────────
+	legacy := wireLegacy(infra, agentsConfigPath)
 
-	// ── Layer 4: Infrastructure — State ────────────────────────────────────
-	stateStore, err := infrastate.NewStateStore(statePath)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to init state store")
-	}
+	// ── Event-Driven: Domain Event Bus + Subscribers ──────────────────────
+	subs := wireSubscribers(infra, legacy, legacy.q)
 
-	// ── Layer 4: Infrastructure — Memory ───────────────────────────────────
-	coreMem, err := memory.NewWithState(dbPath, projectPath, statePath)
-	if err != nil {
-		log.Fatal().Err(err).Msg("failed to init memory store")
-	}
-	defer func() {
-		if err := coreMem.Close(); err != nil {
-			log.Error().Err(err).Msg("failed to close memory store")
-		}
-	}()
-	log.Info().Str("db", dbPath).Msg("memory store ready")
+	// Dispatcher publishes events on the domain bus.
+	dispatcher := infratask.NewQueueDispatcher(subs.domainBus)
 
-	// SQLite-backed checkpoint store (atomic, queryable, co-located with tasks).
-	checkpointStore := inframemory.NewSQLiteCheckpointStore(coreMem)
-	log.Info().Msg("checkpoint store ready (SQLite)")
+	// Task result waiter (listens for task.done / task.failed on domain bus).
+	waiter := infratask.NewEventWaiter(subs.domainBus)
 
-	// Infra memory adapter (satisfies port.MemoryStore).
-	// TODO: wire into use case layer once agent migration is complete.
-	_ = inframemory.NewStore(coreMem)
-
-	// Seed default scope manifests.
-	if ss := coreMem.Scope(); ss != nil {
-		if err := initDefaultScopes(ss); err != nil {
-			log.Warn().Err(err).Msg("failed to seed default scope manifests")
-		}
-	}
-
-	// ── Layer 4: Infrastructure — Telegram & Notifications ─────────────────
-	dualTG := telegram.NewDualChannelClient()
-	if dualTG != nil && dualTG.IsConfigured() {
-		log.Info().Msg("dual-channel Telegram client ready")
-	} else {
-		log.Info().Msg("dual-channel Telegram not configured — pre-exec notifications disabled")
-	}
-
-	// Infra notifier (satisfies port.Notifier)
-	notifier := infranotification.NewTelegramDispatcher(dualTG)
-
-	// Wire fallback notifications: llm.Router → Telegram via goroutine.
-	coreLLMRouter.SetFallbackNotifier(func(evt llm.FallbackEvent) {
-		var evtType domain.EventType
-		ch := domain.StatusChannel
-		msg := fmt.Sprintf("%s → %s", evt.FromModel, evt.ToModel)
-		if evt.Exhausted {
-			evtType = domain.EventFallbackExhausted
-			ch = domain.HumanChannel
-			msg = fmt.Sprintf("All models failed. Last error: %s", evt.Err)
-		} else {
-			evtType = domain.EventFallbackTriggered
-		}
-		go func() {
-			_ = notifier.Dispatch(context.Background(), domain.Event{
-				Type:    evtType,
-				Channel: ch,
-				TaskID:  evt.TaskID,
-				Payload: map[string]string{
-					"message":    msg,
-					"from_model": evt.FromModel,
-					"to_model":   evt.ToModel,
-				},
-				OccurredAt: time.Now(),
-			})
-		}()
-	})
-
-	// Reply store + adapter (satisfies escalation.HumanAsker)
-	replyStore := agent.NewReplyStore()
-	replyAdapter := infraintegrations.NewReplyAdapter(replyStore, dualTG)
-
-	// ── Layer 2: Use Cases — Escalation ────────────────────────────────────
-	var escalCache *escalation.Cache
-	if rs := coreMem.Resolved(); rs != nil {
-		// Wrap the state.ResolvedStore to satisfy escalation.ResolvedQuerier.
-		escalCache = escalation.NewCache(&resolvedQuerierAdapter{rs: rs})
-	} else {
-		escalCache = escalation.NewCache(nil)
-	}
-
-	escalChain := escalation.NewChain(llmRouter, notifier, escalCache, replyAdapter, checkpointStore)
-
-	// ── Layer 2: Use Cases — Phase Runner ──────────────────────────────────
-	phaseRunner := phase.NewRunner()
-
-	// ── Layer 2: Use Cases — Orchestrators ─────────────────────────────────
-	hierarchical := orchestrator.NewHierarchicalOrchestrator(llmRouter, notifier, nil)
-	parallel := orchestrator.NewParallelOrchestrator(phaseRunner, llmRouter, notifier, escalChain, nil, stateStore)
-	loopOrch := orchestrator.NewLoopOrchestrator(phaseRunner, llmRouter, notifier, 3)
-	// TODO: wire orchRouter into the task dispatch path once agent migration is complete.
-	_ = orchestrator.NewOrchestratorRouter(hierarchical, parallel, loopOrch, phaseRunner, llmRouter, notifier)
-
-	// ── Agent Pool (existing layer — not yet migrated to ports) ────────────
-	bus := agent.NewEventBus()
-	factory := agent.AgentFactory(agent.NewBaseAgent)
-	pool := agent.NewPool(bus, factory)
-	q := queue.New()
-	exec := agent.NewExecutor(pool, bus, coreMem)
-
-	exec.SetReplyStore(replyStore)
-	exec.SetQueue(q)
-
-	// ── Spawn Agents ───────────────────────────────────────────────────────
-	spawnAgentsFromConfig(pool, agentsConfigPath)
-
-	preExecDeps := agent.PreExecutorDeps{
-		Telegram:   dualTG,
-		ReplyStore: replyStore,
-		SaveTask:   coreMem.SaveTask,
-	}
-	injectPreExecDeps(pool, preExecDeps)
-
-	// ── Post-run Hooks (Trello) ────────────────────────────────────────────
-	trelloListID := getenv("TRELLO_LIST_ID", "")
-	if trelloListID != "" {
-		hookAPIKey := getenv("TRELLO_API_KEY", "")
-		hookToken := getenv("TRELLO_TOKEN", "")
-		if hookAPIKey != "" && hookToken != "" {
-			hookClient, herr := trello.New(hookAPIKey, hookToken)
-			if herr != nil {
-				log.Warn().Err(herr).Msg("Trello hook client init failed — breakdown cards will not be created")
-			} else {
-				exec.AddPostRunHook(agent.TrelloBreakdownHook(hookClient, trelloListID))
-				log.Info().Msg("Trello breakdown hook registered")
-			}
-		}
-	}
-
-	// ── Recover Suspended Tasks ────────────────────────────────────────────
-	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	if err := exec.RecoverSuspendedTasks(recoverCtx, dualTG); err != nil {
-		log.Warn().Err(err).Msg("RecoverSuspendedTasks failed — some clarify-phase tasks may need manual resume")
-	}
-	recoverCancel()
-
-	// ── Background Context ─────────────────────────────────────────────────
+	// ── Background Context ────────────────────────────────────────────────
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// ── Queue Workers ──────────────────────────────────────────────────────
+	// ── Queue Workers ─────────────────────────────────────────────────────
+	var workerWg sync.WaitGroup
 	roles := []string{
 		"idea", "architect", "breakdown",
 		"coding", "test", "review",
 		"docs", "deploy", "notify",
 	}
 	for _, role := range roles {
-		go runWorker(ctx, role, q, exec)
+		workerWg.Add(1)
+		go func(r string) {
+			defer workerWg.Done()
+			runWorker(ctx, r, legacy.q, legacy.exec)
+		}(role)
 	}
 	log.Info().Strs("roles", roles).Msg("queue workers started")
 
-	// ── Trello Idea Board Poller ───────────────────────────────────────────
+	// ── Trello Idea Board Poller ──────────────────────────────────────────
 	ideaBoardID := getenv("TRELLO_IDEA_BOARD_ID", "")
 	doneListID := getenv("TRELLO_DONE_LIST_ID", "")
 	if ideaBoardID != "" {
 		trelloAPIKey := getenv("TRELLO_API_KEY", "")
 		trelloToken := getenv("TRELLO_TOKEN", "")
-		go pollTrelloIdeas(ctx, ideaBoardID, doneListID, trelloAPIKey, trelloToken, q, 30*time.Second)
+		go pollTrelloIdeas(ctx, ideaBoardID, doneListID, trelloAPIKey, trelloToken, legacy.q, 30*time.Second)
 		log.Info().Str("board", ideaBoardID).Msg("Trello idea board poller started")
 	}
 
-	// ── Trello Trigger Client ──────────────────────────────────────────────
+	// ── Trello Trigger Client ─────────────────────────────────────────────
 	trelloKey := getenv("TRELLO_KEY", getenv("TRELLO_API_KEY", ""))
 	trelloToken := getenv("TRELLO_TOKEN", "")
 	var triggerTrelloClient *trello.Client
 	if trelloKey != "" && trelloToken != "" {
+		var err error
 		triggerTrelloClient, err = trello.New(trelloKey, trelloToken)
 		if err != nil {
 			log.Warn().Err(err).Msg("trigger Trello client init failed — /api/trigger will be unavailable")
 		}
 	}
 
-	// ── HTTP + WebSocket API ───────────────────────────────────────────────
+	// GitHub client for pipeline PR creation.
+	var ghClient *github.Client
+	if github.IsConfigured() {
+		if gh, err := github.New(); err == nil {
+			ghClient = gh
+		} else {
+			log.Warn().Err(err).Msg("GitHub client init failed — pipeline PRs disabled")
+		}
+	}
+
+	// ── HTTP + WebSocket API ──────────────────────────────────────────────
 	telegramToken := getenv("TELEGRAM_BOT_TOKEN", "")
 	telegramChatID := getenv("TELEGRAM_CHAT_ID", "")
-	srv := api.NewServer(pool, q, exec, coreMem, bus, triggerTrelloClient, telegramToken, telegramChatID)
+	srv := api.NewServer(legacy.pool, legacy.q, legacy.exec, infra.coreMem, legacy.bus, triggerTrelloClient, telegramToken, telegramChatID)
 
-	// ── Summarizer + Weekly Cron ───────────────────────────────────────────
+	// Pipeline service now uses port interfaces.
+	pipelineSvc := pipeline.NewService(triggerTrelloClient, ghClient, dispatcher, waiter, subs.domainBus)
+	srv.SetTriggerService(pipelineSvc)
+
+	// ── Summarizer + Weekly Cron ──────────────────────────────────────────
 	anthropicKey := getenv("ANTHROPIC_API_KEY", "")
 	summarizerRouter := llm.NewRouterWithEnv(map[string]string{"ANTHROPIC_API_KEY": anthropicKey})
-	sum := summarizer.New(coreMem, coreMem.AgentDoc(), summarizerRouter, statePath)
+	sum := summarizer.New(infra.coreMem, infra.coreMem.AgentDoc(), summarizerRouter, statePath)
 	srv.SetSummarizer(sum)
 
 	cronScheduler := cron.New()
-	summarizerConfigs := []agent.Config{
+	summarizerConfigs := []domain.AgentConfig{
 		{ID: "idea", Role: "idea"},
 		{ID: "architect", Role: "architect"},
 		{ID: "breakdown", Role: "breakdown"},
@@ -272,15 +151,15 @@ func main() {
 	cronScheduler.Start()
 	defer cronScheduler.Stop()
 
-	// ── HTTP Server ────────────────────────────────────────────────────────
+	// ── HTTP Server ───────────────────────────────────────────────────────
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           srv.Handler(),
 		ReadTimeout:       30 * time.Second,
-		ReadHeaderTimeout: 10 * time.Second, // prevent Slowloris
+		ReadHeaderTimeout: 10 * time.Second,
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MiB
+		MaxHeaderBytes:    1 << 20,
 	}
 	go func() {
 		log.Info().Str("addr", addr).Msg("API server listening")
@@ -289,15 +168,21 @@ func main() {
 		}
 	}()
 
-	// ── Graceful Shutdown ──────────────────────────────────────────────────
+	// ── Graceful Shutdown ─────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	log.Info().Msg("shutting down AgentClaw...")
 
+	// 1. Cancel context — stops workers and pollers.
 	cancel()
 
+	// 1b. Wait for all queue workers to exit.
+	workerWg.Wait()
+	log.Info().Msg("all queue workers stopped")
+
+	// 2. Stop HTTP server — no new requests.
 	httpCtx, httpCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer httpCancel()
 	if err := httpServer.Shutdown(httpCtx); err != nil {
@@ -308,122 +193,26 @@ func main() {
 	srv.Shutdown()
 	log.Info().Msg("WebSocket hub stopped")
 
+	// 3. Stop agents — no new events will be published.
 	agentCtx, agentCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer agentCancel()
-	pool.ShutdownAll(agentCtx)
+	legacy.pool.ShutdownAll(agentCtx)
 	log.Info().Msg("all agents stopped")
 
+	// 4. Stop event-driven layer (proper ordering):
+	//    a) Waiter first — signals pending waiters to unblock.
+	//    b) Subscribers — unsubscribe handlers from bus.
+	//    c) Domain bus — drain in-flight handler goroutines.
+	waiter.Stop()
+	log.Info().Msg("event waiter stopped")
+
+	stopSubscribers(subs)
+
+	subs.domainBus.Stop()
+	log.Info().Msg("domain event bus drained")
+
+	// 5. Infra cleanup (deferred cleanupInfra closes DB).
 	log.Info().Msg("AgentClaw stopped")
-}
-
-// ── resolvedQuerierAdapter bridges state.ResolvedStore → escalation.ResolvedQuerier ──
-
-type resolvedQuerierAdapter struct {
-	rs *state.ResolvedStore
-}
-
-func (a *resolvedQuerierAdapter) Search(question, role string) ([]escalation.CachedAnswer, error) {
-	matches, err := a.rs.Search(question, role)
-	if err != nil {
-		return nil, err
-	}
-	results := make([]escalation.CachedAnswer, len(matches))
-	for i, m := range matches {
-		results[i] = escalation.CachedAnswer{
-			Summary:         m.ResolutionSummary,
-			OccurrenceCount: m.OccurrenceCount,
-		}
-	}
-	return results, nil
-}
-
-func (a *resolvedQuerierAdapter) Save(question, answer, role string) error {
-	return a.rs.Save(state.ErrorPattern{
-		ErrorPattern:      question,
-		ResolutionSummary: answer,
-		AgentRoles:        []string{role},
-	}, answer)
-}
-
-// ── Worker ──────────────────────────────────────────────────────────────────
-
-func runWorker(ctx context.Context, role string, q *queue.Queue, exec *agent.Executor) {
-	log.Info().Str("role", role).Msg("worker started")
-	for {
-		task, err := q.Pop(ctx, role)
-		if err != nil {
-			return
-		}
-		if err := exec.Execute(ctx, task); err != nil {
-			// Do not retry if the parent context was cancelled (graceful shutdown).
-			// Retrying would re-queue a task that will immediately fail again.
-			if ctx.Err() != nil {
-				log.Info().Str("task", task.ID).Str("role", role).Msg("task interrupted by shutdown — not retrying")
-				return
-			}
-			log.Error().Err(err).Str("task", task.ID).Str("role", role).Msg("execute error")
-			q.MarkFailed(task, maxTaskRetries)
-		} else {
-			q.MarkDone(task.ID)
-		}
-	}
-}
-
-// ── Agent Spawning ──────────────────────────────────────────────────────────
-
-func spawnAgentsFromConfig(pool *agent.Pool, configPath string) {
-	configs, err := agent.LoadConfigs(configPath)
-	if err != nil {
-		log.Warn().Err(err).Str("path", configPath).Msg("agent config file not found — using hardcoded defaults")
-		configs = defaultAgentConfigs()
-	}
-
-	for i := range configs {
-		if configs[i].Env == nil {
-			configs[i].Env = make(map[string]string)
-		}
-		for _, key := range configs[i].EnvKeys {
-			if v := os.Getenv(key); v != "" {
-				configs[i].Env[key] = v
-			}
-		}
-	}
-
-	for _, cfg := range configs {
-		a := agent.NewBaseAgent(cfg)
-		if err := pool.Spawn(a); err != nil {
-			log.Error().Err(err).Str("agent", cfg.ID).Msg("spawn failed")
-		}
-	}
-	log.Info().Int("count", len(configs)).Str("source", configPath).Msg("agents spawned")
-}
-
-func defaultAgentConfigs() []agent.Config {
-	anthropicEnv := map[string]string{"ANTHROPIC_API_KEY": os.Getenv("ANTHROPIC_API_KEY")}
-	workerEnv := map[string]string{
-		"MINIMAX_API_KEY": os.Getenv("MINIMAX_API_KEY"),
-		"KIMI_API_KEY":    os.Getenv("KIMI_API_KEY"),
-		"GLM_API_KEY":     os.Getenv("GLM_API_KEY"),
-	}
-	glmEnv := map[string]string{"GLM_API_KEY": os.Getenv("GLM_API_KEY")}
-
-	return []agent.Config{
-		// Orchestration — Opus
-		{ID: "idea-agent-01", Name: "Idea Agent", Role: "idea", Model: "opus", MaxRetries: maxTaskRetries, TimeoutSecs: 120, Env: anthropicEnv},
-		{ID: "architect-01", Name: "Architect", Role: "architect", Model: "opus", MaxRetries: maxTaskRetries, TimeoutSecs: 180, Env: anthropicEnv},
-		{ID: "breakdown-01", Name: "Breakdown", Role: "breakdown", Model: "opus", MaxRetries: maxTaskRetries, TimeoutSecs: 120, Env: anthropicEnv},
-		// Implementation — MiniMax (fallback: Kimi → GLM-5)
-		{ID: "coding-agent-01", Name: "Coder A", Role: "coding", Model: "minimax", MaxRetries: maxTaskRetries, TimeoutSecs: 600, Env: workerEnv},
-		{ID: "coding-agent-02", Name: "Coder B", Role: "coding", Model: "minimax", MaxRetries: maxTaskRetries, TimeoutSecs: 600, Env: workerEnv},
-		// Coordination — Sonnet (test, review)
-		{ID: "test-agent-01", Name: "Tester", Role: "test", Model: "sonnet", MaxRetries: maxTaskRetries, TimeoutSecs: 300, Env: anthropicEnv},
-		{ID: "review-agent-01", Name: "Reviewer", Role: "review", Model: "sonnet", MaxRetries: maxTaskRetries, TimeoutSecs: 300, Env: anthropicEnv},
-		// Docs — MiniMax (fallback: Kimi → GLM-5)
-		{ID: "docs-agent-01", Name: "Docs Writer", Role: "docs", Model: "minimax", MaxRetries: maxTaskRetries, TimeoutSecs: 120, Env: workerEnv},
-		// Infrastructure — GLM-flash
-		{ID: "deploy-agent-01", Name: "Deployer", Role: "deploy", Model: "glm-flash", MaxRetries: maxTaskRetries, TimeoutSecs: 180, Env: glmEnv},
-		{ID: "notify-agent-01", Name: "Notifier", Role: "notify", Model: "glm-flash", MaxRetries: maxTaskRetries, TimeoutSecs: 30, Env: glmEnv},
-	}
 }
 
 // ── Scope Defaults ──────────────────────────────────────────────────────────
@@ -443,7 +232,7 @@ func initDefaultScopes(ss *state.ScopeStore) error {
 
 	for _, m := range manifests {
 		if err := ss.Write(m); err != nil {
-			return fmt.Errorf("initDefaultScopes: %w", err)
+			return err
 		}
 	}
 	return nil
@@ -454,7 +243,7 @@ func initDefaultScopes(ss *state.ScopeStore) error {
 func pollTrelloIdeas(
 	ctx context.Context,
 	boardID, doneListID, apiKey, token string,
-	q *queue.Queue,
+	q interface{ Push(task *adapter.Task) },
 	interval time.Duration,
 ) {
 	client, err := trello.New(apiKey, token)
@@ -485,25 +274,25 @@ func pollTrelloIdeas(
 				log.Info().Str("card", card.ID).Str("title", card.Name).Msg("trello poller: new idea card found")
 
 				ideaID := "T-trello-idea-" + safeTruncate(card.ID, 8)
-				ideaTask := &agent.Task{
+				ideaTask := &adapter.Task{
 					ID:          ideaID,
 					Title:       card.Name,
 					Description: card.Desc,
 					AgentRole:   "idea",
-					Priority:    agent.PriorityNormal,
-					Status:      agent.TaskPending,
+					Priority:    adapter.PriorityNormal,
+					Status:      adapter.TaskPending,
 					CreatedAt:   time.Now(),
 					Meta:        map[string]string{"trello_card_id": card.ID, "trello_card_url": card.ShortURL, "source": "trello_poller"},
 				}
 
 				breakdownID := "T-trello-breakdown-" + safeTruncate(card.ID, 8)
-				breakdownTask := &agent.Task{
+				breakdownTask := &adapter.Task{
 					ID:          breakdownID,
 					Title:       "Breakdown: " + card.Name,
 					Description: card.Desc,
 					AgentRole:   "breakdown",
-					Priority:    agent.PriorityNormal,
-					Status:      agent.TaskPending,
+					Priority:    adapter.PriorityNormal,
+					Status:      adapter.TaskPending,
 					DependsOn:   []string{ideaID},
 					CreatedAt:   time.Now(),
 					Meta:        map[string]string{"trello_card_id": card.ID, "trello_card_url": card.ShortURL, "source": "trello_poller"},
@@ -531,18 +320,6 @@ func safeTruncate(s string, maxLen int) string {
 	return s[:maxLen]
 }
 
-func getenv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
-
-func injectPreExecDeps(pool *agent.Pool, deps agent.PreExecutorDeps) {
-	for _, a := range pool.All() {
-		if ba, ok := a.(*agent.BaseAgent); ok {
-			ba.SetPreExecutorDeps(deps)
-		}
-	}
-	log.Info().Msg("pre-execution deps injected into all agents")
+func newTrelloClient(apiKey, token string) (*trello.Client, error) {
+	return trello.New(apiKey, token)
 }

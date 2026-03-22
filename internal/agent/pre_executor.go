@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/domain"
 	"github.com/patricksign/AgentClaw/internal/integrations/telegram"
 	"github.com/patricksign/AgentClaw/internal/llm"
@@ -45,8 +46,8 @@ const humanWaitTimeout = 24 * time.Hour
 type PreExecutorDeps struct {
 	Telegram   *telegram.DualChannelClient
 	ReplyStore *ReplyStore
-	SaveTask   func(*Task) error // bridge to memory.Store.SaveTask
-	StateStore StateWriter       // optional — may be nil
+	SaveTask   func(*adapter.Task) error // bridge to memory.Store.SaveTask
+	StateStore StateWriter               // optional — may be nil
 }
 
 // StateWriter is satisfied by state.AgentDocStore or any compatible writer.
@@ -87,7 +88,7 @@ func (a *BaseAgent) deps() *PreExecutorDeps {
 }
 
 // saveTask saves the task via the injected SaveTask bridge. Logs on error.
-func (a *BaseAgent) saveTask(task *Task) {
+func (a *BaseAgent) saveTask(task *adapter.Task) {
 	d := a.deps()
 	if d == nil || d.SaveTask == nil {
 		return
@@ -101,7 +102,7 @@ func (a *BaseAgent) saveTask(task *Task) {
 
 // phaseUnderstand calls the agent's model to restate the task, list assumptions,
 // risks, and open questions. Sets task.Phase to PhaseClarify or PhasePlan.
-func (a *BaseAgent) phaseUnderstand(ctx context.Context, task *Task, mem MemoryContext) error {
+func (a *BaseAgent) phaseUnderstand(ctx context.Context, task *adapter.Task, mem adapter.MemoryContext) error {
 	task.Lock()
 	taskID := task.ID
 	taskTitle := task.Title
@@ -168,7 +169,7 @@ Return questions as empty array [] if everything is clear. Be specific.`
 		if strings.TrimSpace(q) == "" {
 			continue
 		}
-		task.Questions = append(task.Questions, Question{
+		task.Questions = append(task.Questions, adapter.Question{
 			ID:        uuid.New().String()[:8],
 			Text:      q,
 			CreatedAt: time.Now(),
@@ -176,9 +177,9 @@ Return questions as empty array [] if everything is clear. Be specific.`
 	}
 
 	if len(task.Questions) > 0 {
-		task.Phase = PhaseClarify
+		task.Phase = adapter.PhaseClarify
 	} else {
-		task.Phase = PhasePlan
+		task.Phase = adapter.PhasePlan
 	}
 	task.PhaseStartedAt = time.Now()
 	questionCount := len(task.Questions)
@@ -229,7 +230,9 @@ func parseUnderstandJSON(content string) (*understandResult, error) {
 // Returns (true, nil) when all questions are resolved and task can move to PhasePlan.
 // Returns (false, nil) when task is suspended waiting for human (caller should not retry immediately).
 // Returns (false, err) on hard failure (timeout, LLM error).
-func (a *BaseAgent) phaseClarify(ctx context.Context, task *Task, mem MemoryContext) (resolved bool, err error) {
+func (a *BaseAgent) phaseClarify(ctx context.Context,
+	task *adapter.Task,
+	mem adapter.MemoryContext) (resolved bool, err error) {
 	// Take a single deep-copy snapshot of the questions under the lock (C3).
 	// This prevents races between phaseClarify iterations and concurrent goroutines
 	// that might reassign task.Questions (e.g. RecoverSuspendedTasks, ResumeTask).
@@ -237,7 +240,7 @@ func (a *BaseAgent) phaseClarify(ctx context.Context, task *Task, mem MemoryCont
 	taskID := task.ID
 	taskTitle := task.Title
 	understanding := task.Understanding
-	snapshot := make([]Question, len(task.Questions))
+	snapshot := make([]adapter.Question, len(task.Questions))
 	copy(snapshot, task.Questions)
 	task.Unlock()
 
@@ -399,7 +402,7 @@ func (a *BaseAgent) phaseClarify(ctx context.Context, task *Task, mem MemoryCont
 
 	// All questions resolved — move to plan.
 	task.Lock()
-	task.Phase = PhasePlan
+	task.Phase = adapter.PhasePlan
 	task.Unlock()
 	a.saveTask(task)
 
@@ -413,7 +416,7 @@ func (a *BaseAgent) phaseClarify(ctx context.Context, task *Task, mem MemoryCont
 // Returns (true, nil) when Opus approves (task.Phase = PhaseImplement).
 // Returns (false, nil) when Opus redirects and task is reset to PhaseUnderstand.
 // Returns (false, err) on hard failure.
-func (a *BaseAgent) phasePlan(ctx context.Context, task *Task, mem MemoryContext) (approved bool, err error) {
+func (a *BaseAgent) phasePlan(ctx context.Context, task *adapter.Task, mem adapter.MemoryContext) (approved bool, err error) {
 	task.Lock()
 	taskID := task.ID
 	taskTitle := task.Title
@@ -424,7 +427,7 @@ func (a *BaseAgent) phasePlan(ctx context.Context, task *Task, mem MemoryContext
 	copy(risks, task.Risks)
 	redirectCount := task.RedirectCount
 	// Deep-copy questions to avoid races with concurrent slice replacement.
-	questions := make([]Question, len(task.Questions))
+	questions := make([]adapter.Question, len(task.Questions))
 	copy(questions, task.Questions)
 	task.Unlock()
 
@@ -502,7 +505,7 @@ Be concise.`
 	if strings.HasPrefix(opusResp, "APPROVED") {
 		task.Lock()
 		task.PlanApprovedBy = supervisorModel
-		task.Phase = PhaseImplement
+		task.Phase = adapter.PhaseImplement
 		task.Unlock()
 		a.saveTask(task)
 
@@ -546,9 +549,9 @@ Be concise.`
 	// Append Opus guidance to description so next phaseUnderstand has more context.
 	task.Lock()
 	task.Description = task.Description + "\n\n[Opus guidance — attempt " + fmt.Sprintf("%d", newRedirectCount) + "]: " + guidance
-	task.Phase = PhaseUnderstand
+	task.Phase = adapter.PhaseUnderstand
 	task.Understanding = ""
-	task.Questions = []Question{}
+	task.Questions = []adapter.Question{}
 	task.ImplementPlan = ""
 	task.RedirectCount = newRedirectCount
 	task.Unlock()
@@ -658,7 +661,7 @@ func (a *BaseAgent) callModel(ctx context.Context, model, system, userMsg string
 
 // ─── State persistence helpers ────────────────────────────────────────────────
 
-func (a *BaseAgent) writeBlockedState(task *Task, resolvedCount, totalCount int, escalatingTo, questionText string) {
+func (a *BaseAgent) writeBlockedState(task *adapter.Task, resolvedCount, totalCount int, escalatingTo, questionText string) {
 	d := a.deps()
 	if d == nil || d.StateStore == nil {
 		return
@@ -684,7 +687,7 @@ func (a *BaseAgent) writeBlockedState(task *Task, resolvedCount, totalCount int,
 	}
 }
 
-func (a *BaseAgent) writeRunningState(task *Task, progress string) {
+func (a *BaseAgent) writeRunningState(task *adapter.Task, progress string) {
 	d := a.deps()
 	if d == nil || d.StateStore == nil {
 		return
@@ -707,7 +710,7 @@ func (a *BaseAgent) writeRunningState(task *Task, progress string) {
 
 // ─── ResolvedStore helpers ────────────────────────────────────────────────────
 
-func (a *BaseAgent) saveToResolvedStore(rs *state.ResolvedStore, question, answer string, task *Task) {
+func (a *BaseAgent) saveToResolvedStore(rs *state.ResolvedStore, question, answer string, task *adapter.Task) {
 	if rs == nil {
 		return
 	}
@@ -734,23 +737,27 @@ func (a *BaseAgent) saveToResolvedStore(rs *state.ResolvedStore, question, answe
 
 // ─── String helpers ───────────────────────────────────────────────────────────
 
-// sanitiseGuidance caps Opus guidance length and removes common prompt-injection
-// markers before the text is injected back into task.Description (S1).
+// sanitiseGuidance caps Opus guidance length and wraps it in data fences
+// to prevent prompt injection when the text is injected into task.Description.
+// Uses a data-fence approach instead of a denylist (which is bypassable via
+// unicode homoglyphs, HTML entities, base64, etc.).
 func sanitiseGuidance(s string) string {
+	runes := []rune(s)
 	const maxLen = 800
-	if len(s) > maxLen {
-		s = s[:maxLen] + "... [truncated]"
+	if len(runes) > maxLen {
+		s = string(runes[:maxLen]) + "... [truncated]"
 	}
-	// Strip known injection markers.
+	// Strip the most obvious injection markers as a defense-in-depth layer.
 	injection := []string{
 		"SYSTEM:", "System:", "<system>", "</system>",
 		"Ignore previous instructions", "ignore all previous",
-		"```", "```json",
 	}
 	for _, marker := range injection {
 		s = strings.ReplaceAll(s, marker, "")
 	}
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+	// Wrap in data fences so the consuming model treats this as reference data.
+	return "<!-- BEGIN OPUS FEEDBACK DATA -->\n" + s + "\n<!-- END OPUS FEEDBACK DATA -->"
 }
 
 // stripMarkdownFences removes leading/trailing markdown code fences from LLM responses.
@@ -783,7 +790,7 @@ func truncate(s string, max int) string {
 // setQuestionAnswer finds the question by ID in task.Questions and marks it resolved.
 // Uses ID-based lookup instead of index to prevent races when the Questions slice
 // is replaced by a concurrent phaseUnderstand (after Opus redirect). Caller must hold task.mu.
-func setQuestionAnswer(task *Task, questionID, answer, answeredBy string) {
+func setQuestionAnswer(task *adapter.Task, questionID, answer, answeredBy string) {
 	for i := range task.Questions {
 		if task.Questions[i].ID == questionID {
 			task.Questions[i].Answer = answer

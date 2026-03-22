@@ -22,3 +22,14 @@ type EscalatorRequest struct {
 type Escalator interface {
 	Resolve(ctx context.Context, req EscalatorRequest) (domain.EscalationResult, error)
 }
+
+// HumanAsker abstracts the human notification channel (Telegram, Slack, etc.).
+// Moved here from usecase/escalation so infra adapters can implement it
+// without importing usecase (clean-arch: dependency rule).
+type HumanAsker interface {
+	AskHuman(ctx context.Context, agentID, taskID, taskTitle, questionID, question string) (msgID int, err error)
+	RegisterReply(msgID int, taskID, questionID string) <-chan string
+	// UnregisterReply removes a pending reply registration. Called when the
+	// wait timeout expires to prevent channel and map entry leaks.
+	UnregisterReply(msgID int)
+}

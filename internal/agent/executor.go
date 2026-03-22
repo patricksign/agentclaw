@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/state"
 	"github.com/rs/zerolog/log"
 )
@@ -13,10 +14,10 @@ import (
 // MemoryStore interface — avoids circular import with the memory package.
 // BuildContext returns a MemoryContext with []*Task to avoid copying mutex values.
 type MemoryStore interface {
-	BuildContext(agentID, role, taskTitle, complexity string) MemoryContext
-	SaveTask(t *Task) error
-	GetTask(id string) (*Task, error)
-	UpdateTaskStatus(id string, status TaskStatus) error
+	BuildContext(agentID, role, taskTitle, complexity string) adapter.MemoryContext
+	SaveTask(t *adapter.Task) error
+	GetTask(id string) (*adapter.Task, error)
+	UpdateTaskStatus(id string, status adapter.TaskStatus) error
 	AddTokens(taskID string, in, out int64, cost float64) error
 	LogTokenUsage(taskID, agentID, model string, in, out int64, cost float64, durationMs int64) error
 	// Resolved returns the ResolvedStore for error-pattern lookups. May be nil.
@@ -27,14 +28,14 @@ type MemoryStore interface {
 	// AddScratchpadEntry appends an entry to the shared team scratchpad.
 	AddScratchpadEntry(entry state.ScratchpadEntry) error
 	// ListTasksByPhase returns all tasks in a given phase with the given status.
-	ListTasksByPhase(phase ExecutionPhase, status TaskStatus) ([]*Task, error)
+	ListTasksByPhase(phase adapter.ExecutionPhase, status adapter.TaskStatus) ([]*adapter.Task, error)
 }
 
 // PostRunHook is called after a task completes successfully. It receives the
 // executing agent, the task, and the result. Errors are logged but do not
 // fail the task — hooks are best-effort side effects (e.g. Trello card
 // creation, Slack notifications).
-type PostRunHook func(ctx context.Context, a Agent, task *Task, result *TaskResult)
+type PostRunHook func(ctx context.Context, a adapter.Agent, task *adapter.Task, result *adapter.TaskResult)
 
 // Executor wires Pool + Queue + Memory + EventBus together for task execution.
 type Executor struct {
@@ -49,7 +50,7 @@ type Executor struct {
 
 // taskQueuer is the minimal queue interface needed by RecoverSuspendedTasks.
 type taskQueuer interface {
-	Push(task *Task)
+	Push(task *adapter.Task)
 }
 
 func NewExecutor(pool *Pool, bus *EventBus, mem MemoryStore) *Executor {
@@ -87,7 +88,7 @@ func (e *Executor) ResumeTask(ctx context.Context, taskID string) error {
 	phase := task.Phase
 	task.Unlock()
 
-	if phase != PhaseClarify {
+	if phase != adapter.PhaseClarify {
 		return fmt.Errorf("ResumeTask: task %s is in phase %s, not clarify", taskID, phase)
 	}
 	if e.queue == nil {
@@ -105,7 +106,7 @@ func (e *Executor) RecoverSuspendedTasks(ctx context.Context, tg suspendedNotifi
 	if e.queue == nil {
 		return nil
 	}
-	tasks, err := e.mem.ListTasksByPhase(PhaseClarify, TaskRunning)
+	tasks, err := e.mem.ListTasksByPhase(adapter.PhaseClarify, adapter.TaskRunning)
 	if err != nil {
 		return fmt.Errorf("RecoverSuspendedTasks: query: %w", err)
 	}
@@ -117,7 +118,7 @@ func (e *Executor) RecoverSuspendedTasks(ctx context.Context, tg suspendedNotifi
 		phaseStartedAt := task.PhaseStartedAt
 		// Deep copy the questions slice (C4) — the backing array must not be
 		// shared with phaseClarify which may iterate it concurrently after re-queue.
-		questions := make([]Question, len(task.Questions))
+		questions := make([]adapter.Question, len(task.Questions))
 		copy(questions, task.Questions)
 		task.Unlock()
 
@@ -152,7 +153,7 @@ type suspendedNotifier interface {
 }
 
 // Execute runs a task on the first available agent for the required role.
-func (e *Executor) Execute(ctx context.Context, task *Task) error {
+func (e *Executor) Execute(ctx context.Context, task *adapter.Task) error {
 	// Snapshot all fields needed for this execution under a single lock to
 	// avoid data races with concurrent readers (HTTP status endpoints, etc.).
 	task.Lock()
@@ -179,7 +180,7 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 	// Atomically update task fields before handing off to the agent.
 	now := time.Now()
 	task.Lock()
-	task.Status = TaskRunning
+	task.Status = adapter.TaskRunning
 	task.StartedAt = &now
 	task.AssignedTo = agentID
 	task.Unlock()
@@ -191,8 +192,8 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 		return fmt.Errorf("execute: save task %s: %w", taskID, err)
 	}
 
-	e.bus.Publish(Event{
-		Type:    EvtTaskStarted,
+	e.bus.Publish(adapter.Event{
+		Type:    adapter.EvtTaskStarted,
 		AgentID: agentID,
 		TaskID:  taskID,
 	})
@@ -236,12 +237,21 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 	defer cancel()
 
 	result, err := a.Run(runCtx, task, memCtx)
+
+	// Handle suspended tasks: Run returns (nil, nil) when the task is waiting
+	// for human input (e.g. PhaseClarify). Do NOT mark as Done — leave status
+	// as TaskRunning so it can be resumed via ResumeTask.
+	if err == nil && result == nil {
+		log.Info().Str("task", taskID).Msg("task suspended (waiting for input)")
+		return nil
+	}
+
 	if err != nil {
 		task.Lock()
-		task.Status = TaskFailed
+		task.Status = adapter.TaskFailed
 		task.Unlock()
 
-		if dbErr := e.mem.UpdateTaskStatus(taskID, TaskFailed); dbErr != nil {
+		if dbErr := e.mem.UpdateTaskStatus(taskID, adapter.TaskFailed); dbErr != nil {
 			log.Error().Err(dbErr).Str("task", taskID).Msg("UpdateTaskStatus(failed) failed")
 		}
 
@@ -277,8 +287,8 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 			Timestamp: time.Now(),
 		})
 
-		e.bus.Publish(Event{
-			Type:    EvtTaskFailed,
+		e.bus.Publish(adapter.Event{
+			Type:    adapter.EvtTaskFailed,
 			AgentID: agentID,
 			TaskID:  taskID,
 			Payload: err.Error(),
@@ -322,8 +332,8 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 				log.Warn().Str("task", taskID).Msg("token accounting inconsistent: AddTokens succeeded but LogTokenUsage failed")
 			}
 		}
-		e.bus.Publish(Event{
-			Type:    EvtTokenLogged,
+		e.bus.Publish(adapter.Event{
+			Type:    adapter.EvtTokenLogged,
 			AgentID: agentID,
 			TaskID:  taskID,
 			Payload: result,
@@ -332,16 +342,16 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 
 	finished := time.Now()
 	task.Lock()
-	task.Status = TaskDone
+	task.Status = adapter.TaskDone
 	task.FinishedAt = &finished
 	task.Unlock()
 
-	if err := e.mem.UpdateTaskStatus(taskID, TaskDone); err != nil {
+	if err := e.mem.UpdateTaskStatus(taskID, adapter.TaskDone); err != nil {
 		log.Error().Err(err).Str("task", taskID).Msg("UpdateTaskStatus(done) failed")
 	}
 
-	e.bus.Publish(Event{
-		Type:    EvtTaskDone,
+	e.bus.Publish(adapter.Event{
+		Type:    adapter.EvtTaskDone,
 		AgentID: agentID,
 		TaskID:  taskID,
 		Payload: result,
@@ -378,16 +388,29 @@ func (e *Executor) Execute(ctx context.Context, task *Task) error {
 	}
 
 	// Run post-completion hooks (Trello card creation, notifications, etc.).
+	// Hooks receive a shallow copy of result so that mutations (e.g. appending
+	// to Artifacts in TrelloBreakdownHook) do not race with the event bus.
 	// Errors are logged but never fail the task.
-	for _, hook := range e.hooks {
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.Error().Interface("panic", r).Str("task", taskID).Msg("post-run hook panicked")
-				}
+	if result != nil {
+		hookResult := *result
+		hookResult.Artifacts = make([]adapter.Artifact, len(result.Artifacts))
+		copy(hookResult.Artifacts, result.Artifacts)
+		if result.Meta != nil {
+			hookResult.Meta = make(map[string]string, len(result.Meta))
+			for k, v := range result.Meta {
+				hookResult.Meta[k] = v
+			}
+		}
+		for _, hook := range e.hooks {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Error().Interface("panic", r).Str("task", taskID).Msg("post-run hook panicked")
+					}
+				}()
+				hook(ctx, a, task, &hookResult)
 			}()
-			hook(ctx, a, task, result)
-		}()
+		}
 	}
 
 	return nil
@@ -417,7 +440,7 @@ func nextRole(role string) string {
 
 // isMemoryWorthy reports whether a completed task's outcome should be appended
 // to the role's agent doc for future reference.
-func isMemoryWorthy(task *Task) bool {
+func isMemoryWorthy(task *adapter.Task) bool {
 	task.Lock()
 	role := task.AgentRole
 	// Deep-copy tags to avoid iterating a shared backing array after unlock.

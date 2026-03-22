@@ -11,6 +11,18 @@ const (
 	HumanChannel                 // human↔agent Q&A
 )
 
+// String returns the channel name for logging/debugging.
+func (c Channel) String() string {
+	switch c {
+	case StatusChannel:
+		return "status"
+	case HumanChannel:
+		return "human"
+	default:
+		return "unknown"
+	}
+}
+
 // ─── Event Types ────────────────────────────────────────────────────────────
 
 type EventType string
@@ -32,6 +44,20 @@ const (
 	EventParallelDone       EventType = "parallel.done"
 	EventFallbackTriggered  EventType = "fallback.triggered"
 	EventFallbackExhausted  EventType = "fallback.exhausted"
+
+	// Event-driven architecture — task lifecycle
+	EventTaskSubmitted EventType = "task.submitted"
+	EventTaskAssigned  EventType = "task.assigned"
+
+	// Event-driven architecture — pipeline lifecycle
+	EventPipelineStarted   EventType = "pipeline.started"
+	EventPipelineCompleted EventType = "pipeline.completed"
+	EventPipelinePartial   EventType = "pipeline.partial"
+
+	// Event-driven architecture — integration events
+	EventPRCreated     EventType = "pr.created"
+	EventDeployStarted EventType = "deploy.started"
+	EventDeployDone    EventType = "deploy.done"
 )
 
 // Event represents something that happened in the system.

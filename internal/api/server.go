@@ -4,38 +4,37 @@ import (
 	"context"
 	"net/http"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
 	"github.com/patricksign/AgentClaw/internal/integrations/pipeline"
 	"github.com/patricksign/AgentClaw/internal/integrations/trello"
 	"github.com/patricksign/AgentClaw/internal/memory"
-	"github.com/patricksign/AgentClaw/internal/queue"
+	"github.com/patricksign/AgentClaw/internal/port"
 	"github.com/patricksign/AgentClaw/internal/state"
-	"github.com/patricksign/AgentClaw/internal/summarizer"
 )
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
 type Server struct {
-	pool        *agent.Pool
-	queue       *queue.Queue
-	mem         *memory.Store
-	bus         *agent.EventBus
+	pool        port.AgentPool         // clean-arch: was *agent.Pool
+	queue       port.TaskQueue         // clean-arch: was *queue.Queue
+	executor    port.TaskExecutor      // clean-arch: was *agent.Executor (stored for handlers)
+	events      port.EventBus           // clean-arch: was *agent.EventBus
+	mem         *memory.Store          // legacy — separate migration
 	hub         *wsHub
-	triggerSvc  *pipeline.Service
+	triggerSvc  *pipeline.Service      // legacy — separate migration
 	resolved    *state.ResolvedStore   // may be nil
 	scratchpad  *state.Scratchpad      // may be nil
-	summarizer  *summarizer.Summarizer // may be nil — set via SetSummarizer
+	summarizer  port.HistorySummarizer // clean-arch: was *summarizer.Summarizer
 	rateLimiter *rateLimiter
 	ctx         context.Context    // server-scoped context — cancelled on Shutdown
 	cancel      context.CancelFunc // cancels ctx
 }
 
 func NewServer(
-	pool *agent.Pool,
-	q *queue.Queue,
-	exec *agent.Executor,
+	pool port.AgentPool,
+	q port.TaskQueue,
+	exec port.TaskExecutor,
 	mem *memory.Store,
-	bus *agent.EventBus,
+	events port.EventBus,
 	trelloClient *trello.Client,
 	telegramToken string,
 	telegramChatID string,
@@ -44,10 +43,10 @@ func NewServer(
 	s := &Server{
 		pool:        pool,
 		queue:       q,
+		executor:    exec,
 		mem:         mem,
-		bus:         bus,
+		events:      events,
 		hub:         newWsHub(),
-		triggerSvc:  pipeline.NewService(trelloClient, exec, q, bus),
 		resolved:    mem.Resolved(),   // may be nil — endpoints handle nil gracefully
 		scratchpad:  mem.Scratchpad(), // may be nil
 		rateLimiter: newRateLimiter(),
@@ -60,18 +59,24 @@ func NewServer(
 	return s
 }
 
-// Shutdown stops the WebSocket hub and its event-forwarding goroutine.
-// Call this after the HTTP server has stopped accepting new connections.
+// SetSummarizer sets the history summarizer (optional — may be nil).
+func (s *Server) SetSummarizer(sum port.HistorySummarizer) {
+	s.summarizer = sum
+}
+
+// SetTriggerService sets the pipeline trigger service (optional).
+func (s *Server) SetTriggerService(svc *pipeline.Service) {
+	s.triggerSvc = svc
+}
+
 // Shutdown stops background pipelines and the WebSocket hub.
-// Call this after the HTTP server has stopped accepting new connections.
 func (s *Server) Shutdown() {
-	s.cancel() // cancel all in-flight pipeline goroutines
+	s.cancel()
 	s.hub.shutdown()
 	s.rateLimiter.Stop()
 }
 
 // Context returns the server-scoped context that is cancelled on Shutdown.
-// Use this for background work that should stop when the server stops.
 func (s *Server) Context() context.Context {
 	return s.ctx
 }

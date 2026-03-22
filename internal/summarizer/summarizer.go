@@ -8,7 +8,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
+	"github.com/patricksign/AgentClaw/internal/domain"
 	"github.com/patricksign/AgentClaw/internal/llm"
 	"github.com/rs/zerolog/log"
 )
@@ -23,7 +24,7 @@ const (
 
 // TaskStore is the subset of memory.Store used by Summarizer.
 type TaskStore interface {
-	RecentByRole(role string, n int) ([]*agent.Task, error)
+	RecentByRole(role string, n int) ([]*adapter.Task, error)
 	LogTokenUsage(taskID, agentID, model string, in, out int64, cost float64, durationMs int64) error
 }
 
@@ -116,7 +117,7 @@ func (s *Summarizer) CompressAgentHistory(ctx context.Context, agentID, role str
 
 // CompressAll runs CompressAgentHistory for each agent config sequentially.
 // Returns the total cost and any first error encountered.
-func (s *Summarizer) CompressAll(ctx context.Context, agents []agent.Config) (float64, error) {
+func (s *Summarizer) CompressAll(ctx context.Context, agents []domain.AgentConfig) (float64, error) {
 	var totalCost float64
 	for _, cfg := range agents {
 		cost, _, err := s.CompressAgentHistory(ctx, cfg.ID, cfg.Role)
@@ -131,7 +132,7 @@ func (s *Summarizer) CompressAll(ctx context.Context, agents []agent.Config) (fl
 }
 
 // buildTaskListMessage formats the task list as a user message for the LLM.
-func buildTaskListMessage(agentID, role string, tasks []*agent.Task) string {
+func buildTaskListMessage(agentID, role string, tasks []*adapter.Task) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Agent: %s (role: %s)\nRecent completed tasks (%d):\n\n", agentID, role, len(tasks)))
 	for _, t := range tasks {
@@ -143,7 +144,7 @@ func buildTaskListMessage(agentID, role string, tasks []*agent.Task) string {
 }
 
 // archiveTasks writes the raw task list to stateDir/old/summary-<agentID>-<date>.md.
-func (s *Summarizer) archiveTasks(agentID string, tasks []*agent.Task, content string) error {
+func (s *Summarizer) archiveTasks(agentID string, tasks []*adapter.Task, content string) error {
 	dir := filepath.Join(s.stateDir, "old")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("summarizer: mkdir %s: %w", dir, err)

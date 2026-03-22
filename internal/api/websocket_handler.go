@@ -41,7 +41,7 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 // forwardEvents subscribes to EventBus and broadcasts to all WS clients.
 // Exits when the server context is cancelled (Shutdown) or the bus channel closes.
 func (s *Server) forwardEvents() {
-	ch, unsub := s.bus.Subscribe("ws-hub")
+	ch, unsub := s.events.Subscribe("ws-hub")
 	defer unsub()
 	for {
 		select {
@@ -171,6 +171,8 @@ func (h *wsHub) connect(conn *websocket.Conn) {
 
 	// read pump — on disconnect, trigger cleanup so unregister fires even if
 	// the write pump is blocked on a send.
+	// Limit read size to 4 KiB to prevent OOM from malicious large messages.
+	conn.SetReadLimit(4096)
 	go func() {
 		defer cleanup()
 		for {

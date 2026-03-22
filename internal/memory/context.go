@@ -4,9 +4,10 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"time"
 
-	"github.com/patricksign/AgentClaw/internal/agent"
+	"github.com/patricksign/AgentClaw/internal/adapter"
 	"github.com/patricksign/AgentClaw/internal/state"
 	"github.com/rs/zerolog/log"
 )
@@ -85,11 +86,11 @@ func NewWithState(dbPath, projectPath, stateBaseDir string) (*Store, error) {
 // (S=2000, M=6000, L=12000 tokens).
 //
 // If complexity is empty it defaults to "M".
-func (s *Store) BuildContext(agentID, role, taskTitle, complexity string) agent.MemoryContext {
+func (s *Store) BuildContext(agentID, role, taskTitle, complexity string) adapter.MemoryContext {
 	if complexity == "" {
 		complexity = "M"
 	}
-	ctx := agent.MemoryContext{}
+	ctx := adapter.MemoryContext{}
 
 	// ── Tier 1 — always loaded ────────────────────────────────────────────
 
@@ -114,78 +115,114 @@ func (s *Store) BuildContext(agentID, role, taskTitle, complexity string) agent.
 	// Scratchpad: compact last-24 h team status (cap 400 tokens).
 	ctx.Scratchpad = s.scratchpad
 
-	// ── Tier 2 — M or L ──────────────────────────────────────────────────
-
-	// Read project doc once; tier determines the token cap applied below.
-	rawProjectDoc := s.ReadProjectDoc()
+	// ── Tier 2+3 — parallel I/O for M and L ─────────────────────────────
+	// SQLite WAL mode supports concurrent readers. Independent queries run
+	// in parallel to reduce BuildContext latency (especially for L-complexity).
 
 	if complexity == "M" || complexity == "L" {
-		// RecentByRole: fetch 5 for L, 3 for M — single query avoids redundant DB call.
+		var wg sync.WaitGroup
+		var mu sync.Mutex // protects ctx fields
+
 		recentLimit := 3
 		if complexity == "L" {
 			recentLimit = 5
 		}
-		recent, err := s.RecentByRole(role, recentLimit)
-		if err != nil {
-			log.Warn().Err(err).Str("role", role).Msg("BuildContext: RecentByRole failed")
-		} else {
+
+		// Parallel: project doc (file I/O)
+		var rawProjectDoc string
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rawProjectDoc = s.ReadProjectDoc()
+		}()
+
+		// Parallel: recent tasks (DB query)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			recent, err := s.RecentByRole(role, recentLimit)
+			if err != nil {
+				log.Warn().Err(err).Str("role", role).Msg("BuildContext: RecentByRole failed")
+				return
+			}
+			var entries []string
 			for _, t := range recent {
 				t.Lock()
-				title, desc := t.Title, t.Description
-				status := t.Status
+				title, desc, status := t.Title, t.Description, t.Status
 				t.Unlock()
-				entry := truncateToTokens(fmt.Sprintf("[%s] %s: %s", status, title, desc), 300)
-				ctx.RelevantCode = append(ctx.RelevantCode, entry)
+				entries = append(entries, truncateToTokens(fmt.Sprintf("[%s] %s: %s", status, title, desc), 300))
 			}
+			mu.Lock()
+			ctx.RelevantCode = append(ctx.RelevantCode, entries...)
 			ctx.RecentTasks = recent
-		}
+			mu.Unlock()
+		}()
 
-		// ResolvedStore: top-3 matching error patterns (cap 200 tokens each).
+		// Parallel: resolved error patterns (file I/O + search)
 		if s.resolved != nil {
-			if matches, serr := s.resolved.Search(taskTitle, role); serr == nil {
-				top := matches
-				if len(top) > 3 {
-					top = top[:3]
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				matches, serr := s.resolved.Search(taskTitle, role)
+				if serr != nil {
+					return
 				}
-				for _, m := range top {
-					snippet := truncateToTokens(
+				if len(matches) > 3 {
+					matches = matches[:3]
+				}
+				var snippets []string
+				for _, m := range matches {
+					snippets = append(snippets, truncateToTokens(
 						fmt.Sprintf("**%s** (seen %d×)\nFix: %s", m.ErrorPattern, m.OccurrenceCount, m.ResolutionSummary),
 						200,
-					)
-					ctx.RelevantCode = append(ctx.RelevantCode, snippet)
+					))
 				}
-			}
+				mu.Lock()
+				ctx.RelevantCode = append(ctx.RelevantCode, snippets...)
+				mu.Unlock()
+			}()
 		}
 
-		// Project doc: first 800 tokens only (M), full 2000 tokens (L).
+		// Parallel (L only): scope.ReadAll + ListADRs
+		if complexity == "L" {
+			if s.scope != nil {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					all, aerr := s.scope.ReadAll()
+					if aerr != nil {
+						log.Warn().Err(aerr).Msg("BuildContext: ScopeStore.ReadAll failed")
+						return
+					}
+					mu.Lock()
+					for i := range all {
+						ctx.AllScopes = append(ctx.AllScopes, &all[i])
+					}
+					mu.Unlock()
+				}()
+			}
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				adrs, err := s.ListADRs()
+				if err != nil {
+					log.Warn().Err(err).Msg("BuildContext: ListADRs failed")
+					return
+				}
+				mu.Lock()
+				ctx.ADRs = adrs
+				mu.Unlock()
+			}()
+		}
+
+		wg.Wait()
+
+		// Apply project doc cap (needs rawProjectDoc from goroutine).
 		if complexity == "L" {
 			ctx.ProjectDoc = truncateToTokens(rawProjectDoc, 2000)
 		} else {
 			ctx.ProjectDoc = truncateToTokens(rawProjectDoc, 800)
-		}
-	}
-
-	// ── Tier 3 — L only ──────────────────────────────────────────────────
-
-	if complexity == "L" {
-
-		// Cross-agent awareness via ScopeStore.ReadAll().
-		if s.scope != nil {
-			if all, aerr := s.scope.ReadAll(); aerr != nil {
-				log.Warn().Err(aerr).Msg("BuildContext: ScopeStore.ReadAll failed")
-			} else {
-				for i := range all {
-					ctx.AllScopes = append(ctx.AllScopes, &all[i])
-				}
-			}
-		}
-
-		// ADRs are only loaded at tier 3 to keep lower tiers lean.
-		adrs, err := s.ListADRs()
-		if err != nil {
-			log.Warn().Err(err).Msg("BuildContext: ListADRs failed")
-		} else {
-			ctx.ADRs = adrs
 		}
 	}
 

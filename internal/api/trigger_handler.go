@@ -47,20 +47,21 @@ func (s *Server) handleTrigger(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Return 202 immediately; run pipeline in background.
-	writeJSON(w, http.StatusAccepted, map[string]string{
-		"status":       "accepted",
-		"workspace_id": req.WorkspaceID,
-		"ticket_id":    req.TicketID,
-	})
-
 	// Acquire semaphore slot — reject if at capacity.
+	// Must happen BEFORE writing 202 to avoid double HTTP response.
 	select {
 	case pipelineSem <- struct{}{}:
 	default:
 		errJSON(w, http.StatusTooManyRequests, "too many concurrent pipelines, try again later")
 		return
 	}
+
+	// Return 202 only after semaphore acquired successfully.
+	writeJSON(w, http.StatusAccepted, map[string]string{
+		"status":       "accepted",
+		"workspace_id": req.WorkspaceID,
+		"ticket_id":    req.TicketID,
+	})
 
 	go func() {
 		defer func() { <-pipelineSem }()
