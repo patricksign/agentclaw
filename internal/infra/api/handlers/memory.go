@@ -29,7 +29,7 @@ func (h *MemoryHandlers) getContext(w http.ResponseWriter, r *http.Request) {
 	title := r.URL.Query().Get("title")
 	complexity := r.URL.Query().Get("complexity")
 
-	ctx := h.mem.BuildContext(agentID, role, title, complexity)
+	ctx := h.mem.BuildContext(r.Context(), agentID, role, title, complexity)
 	respondJSON(w, http.StatusOK, ctx)
 }
 

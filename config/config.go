@@ -16,6 +16,7 @@ type Config struct {
 	Database   DatabaseConfig   `mapstructure:"database" json:"database,omitempty"`
 	Redis      RedisConfig      `mapstructure:"redis" json:"redis,omitempty"`
 	Neo4j      Neo4jConfig      `mapstructure:"neo4j" json:"neo4j,omitempty"`
+	Qdrant     QdrantConfig     `mapstructure:"qdrant" json:"qdrant,omitempty"`
 	Middleware MiddlewareConfig `mapstructure:"middleware" json:"middleware,omitempty"`
 	LLM        LLMConfig        `mapstructure:"llm" json:"llm,omitempty"`
 	Telegram   TelegramConfig   `mapstructure:"telegram" json:"telegram,omitempty"`
@@ -110,6 +111,17 @@ type RedisConfig struct {
 	DialTimeout  time.Duration `mapstructure:"dialTimeout" json:"dial_timeout,omitempty"`
 	ReadTimeout  time.Duration `mapstructure:"readTimeout" json:"read_timeout,omitempty"`
 	WriteTimeout time.Duration `mapstructure:"writeTimeout" json:"write_timeout,omitempty"`
+}
+
+type QdrantConfig struct {
+	Host   string `mapstructure:"host" json:"host,omitempty"`
+	Port   int    `mapstructure:"port" json:"port,omitempty"`
+	APIKey string `mapstructure:"api_key" json:"api_key,omitempty"`
+	GRPC   bool   `mapstructure:"grpc" json:"grpc,omitempty"`
+}
+
+func (q QdrantConfig) BaseURL() string {
+	return fmt.Sprintf("http://%s:%d", q.Host, q.Port)
 }
 
 type Neo4jConfig struct {

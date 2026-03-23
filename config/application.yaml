@@ -34,6 +34,11 @@ database:
   maxIdleConnections: 10
   maxConnLifetime: 10s
   maxConnIdleTime: 10s
+qdrant:
+  host: localhost
+  port: 6333
+  api_key: ""
+  grpc: false
 neo4j:
   host: localhost
   port: 7687

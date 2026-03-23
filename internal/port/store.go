@@ -1,6 +1,7 @@
 package port
 
 import (
+	"context"
 	"time"
 
 	"github.com/patricksign/AgentClaw/internal/domain"
@@ -10,10 +11,12 @@ import (
 
 // TaskFilter constrains which tasks are returned by ListTasks.
 type TaskFilter struct {
-	Role   string `json:"role"`
-	Status string `json:"status"`
-	Phase  string `json:"phase"`
-	Limit  int    `json:"limit"`
+	AgentID string `json:"agent_id"`
+	Role    string `json:"role"`
+	Status  string `json:"status"`
+	Phase   string `json:"phase"`
+	Limit   int    `json:"limit"`
+	Offset  int    `json:"offset"`
 }
 
 // TaskStore persists and retrieves tasks.
@@ -88,7 +91,7 @@ type MemoryContext struct {
 
 // MemoryStore builds and manages the multi-layer memory context for agents.
 type MemoryStore interface {
-	BuildContext(agentID, role, taskTitle, complexity string) MemoryContext
+	BuildContext(ctx context.Context, agentID, role, taskTitle, complexity string) MemoryContext
 	AppendProjectDoc(section string) error
 }
 
